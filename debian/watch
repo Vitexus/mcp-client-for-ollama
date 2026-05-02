@@ -1,0 +1,3 @@
+# Debian watch file for mcp-client-for-ollama
+version=4
+https://github.com/jonigl/mcp-client-for-ollama/releases/download/v(.*)\.tar\.gz

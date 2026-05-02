@@ -1,0 +1,25 @@
+MCP Client for Ollama for Debian
+
+MCP Client for Ollama (ollmcp) is a modern, interactive terminal application 
+for connecting local Ollama LLMs to Model Context Protocol (MCP) servers.
+
+Requirements:
+ - Python 3.10 or newer
+ - Ollama running locally (https://ollama.com/download)
+
+Usage:
+ Start the client by running:
+   mcp-client-for-ollama
+
+ Or using the alias:
+   ollmcp
+
+Configuration:
+ MCP server configurations are typically stored in:
+ - ~/.config/Claude/mcp.json (auto-discovered for Claude setups)
+ - Custom paths can be configured through the application
+
+For more information, see the upstream documentation at:
+https://github.com/jonigl/mcp-client-for-ollama
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Sat, 02 May 2026 19:01:01 +0200

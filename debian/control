@@ -1,0 +1,40 @@
+Source: mcp-client-for-ollama
+Section: python
+Priority: optional
+Maintainer: Vítězslav Dvořák <info@vitexsoftware.cz>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-setuptools,
+ python3-mcp,
+ python3-rich,
+Standards-Version: 4.7.0
+Homepage: https://github.com/jonigl/mcp-client-for-ollama
+Rules-Requires-Root: no
+Vcs-Git: https://github.com/jonigl/mcp-client-for-ollama.git
+Vcs-Browser: https://github.com/jonigl/mcp-client-for-ollama
+
+Package: mcp-client-for-ollama
+Architecture: all
+Multi-Arch: foreign
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ python3 (>= 3.10),
+ python3-mcp,
+ python3-ollama,
+ python3-prompt-toolkit,
+ python3-rich,
+ python3-typer,
+Provides: ollmcp
+Description: MCP Client for Ollama
+ MCP Client for Ollama (ollmcp) is a modern, interactive terminal
+ application for connecting local Ollama LLMs to one or more Model
+ Context Protocol (MCP) servers, enabling advanced tool use and
+ workflow automation.
+ .
+ Features include multi-server support, MCP prompts, agent mode,
+ human-in-the-loop tool execution, advanced model configuration,
+ fuzzy autocomplete, performance metrics, and streaming responses.

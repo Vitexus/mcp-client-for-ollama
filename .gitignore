@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+.pybuild/
+debian/mcp-client-for-ollama.postinst.debhelper
+debian/mcp-client-for-ollama.substvars
+debian/mcp-client-for-ollama/
+debian/.debhelper/
+debian/mcp-client-for-ollama.prerm.debhelper
+debian/debhelper-build-stamp
+debian/files

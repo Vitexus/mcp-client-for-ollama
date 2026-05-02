@@ -1,0 +1,7 @@
+mcp-client-for-ollama (0.28.0) unstable; urgency=medium
+
+  * Release version 0.28.0
+  * Features: Agent mode, MCP prompts support, multiple display modes
+  * Improvements: Performance metrics, streaming responses, history management
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Sat, 02 May 2026 19:01:01 +0200

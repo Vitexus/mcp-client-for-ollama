@@ -1,0 +1,18 @@
+MCP Client for Ollama - Source Building
+
+Building from source:
+ dpkg-buildpackage -us -uc
+
+Or using git-buildpackage:
+ gbp buildpackage --git-no-sign
+
+The package uses pybuild for building Python packages.
+Dependencies are automatically installed from pyproject.toml.
+
+For development, you can also install directly:
+ pip install -e .
+
+For more information about the upstream project, see:
+https://github.com/jonigl/mcp-client-for-ollama
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Sat, 02 May 2026 19:01:01 +0200

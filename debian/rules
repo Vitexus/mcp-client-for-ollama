@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+# You must remove unused comment lines for the released package.
+#export DH_VERBOSE = 1
+#export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+#export DEB_CFLAGS_MAINT_APPEND  = -Wall -pedantic
+#export DEB_LDFLAGS_MAINT_APPEND = -Wl,-O1
+
+
+# Skip tests during package build if DEB_BUILD_OPTIONS contains nocheck
+override_dh_auto_test:
+	-test -z "$(filter nocheck,$(DEB_BUILD_OPTIONS))" && dh_auto_test
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
