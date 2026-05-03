@@ -43,6 +43,11 @@ from .utils.tool_display import ToolDisplayManager
 from .utils.hil_manager import HumanInTheLoopManager, AbortQueryException
 from .utils.fzf_style_completion import FZFStyleCompleter
 from .utils.input import get_input_no_autocomplete
+from .utils.schema_validation import (
+    SchemaValidationError,
+    normalize_tool_arguments,
+    validate_tool_arguments,
+)
 
 
 class MCPClient:
@@ -501,6 +506,10 @@ class MCPClient:
             self.actual_token_count += metrics['eval_count']
 
         enabled_tools = self.tool_manager.get_enabled_tool_objects()
+        tool_schema_map = {
+            tool.name: (tool.inputSchema or {"type": "object"})
+            for tool in enabled_tool_objects
+        }
 
         loop_count = 0
         pending_tool_calls = tool_calls
@@ -523,7 +532,20 @@ class MCPClient:
 
             for tool in pending_tool_calls:
                 tool_name = tool.function.name
-                tool_args = tool.function.arguments
+                raw_tool_args = tool.function.arguments
+
+                try:
+                    tool_args = normalize_tool_arguments(raw_tool_args)
+                    validate_tool_arguments(tool_args, tool_schema_map.get(tool_name))
+                except SchemaValidationError as e:
+                    error_msg = f"Schema validation failed for {tool_name}: {str(e)}"
+                    self.console.print(f"[red]{error_msg}[/red]")
+                    messages.append({
+                        "role": "tool",
+                        "content": error_msg,
+                        "tool_name": tool_name
+                    })
+                    continue
 
                 # Parse server name and actual tool name from the qualified name
                 server_name, actual_tool_name = tool_name.split('.', 1) if '.' in tool_name else (None, tool_name)
