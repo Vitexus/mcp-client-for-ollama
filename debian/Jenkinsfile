@@ -3,10 +3,10 @@
 // Current version of this Pipeline https://github.com/VitexSoftware/BuildImages/blob/main/Test/Jenkinsfile
 
 String[] distributions = [
-			'debian:trixie', 
-#			'debian:forky', 
-#			'ubuntu:noble',
-#			'ubuntu:resolute',
+			'debian:trixie'
+//			'debian:forky', 
+//			'ubuntu:noble',
+//			'ubuntu:resolute',
 ]
 
 String vendor = 'vitexsoftware'
