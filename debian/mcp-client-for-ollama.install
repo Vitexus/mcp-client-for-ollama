@@ -1,1 +1,2 @@
 # Files are installed by pybuild
+debian/mcp-client-for-ollama.metainfo.xml usr/share/metainfo/

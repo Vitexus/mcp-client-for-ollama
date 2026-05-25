@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.jonigl.mcp-client-for-ollama</id>
+  <name>MCP Client for Ollama</name>
+  <summary>Interactive terminal application for connecting local Ollama LLMs to MCP servers</summary>
+  <description>
+    <p>MCP Client for Ollama (ollmcp) is a modern, interactive terminal application for connecting
+    local Ollama LLMs to one or more Model Context Protocol (MCP) servers, enabling advanced
+    tool use and workflow automation.</p>
+    <p>Features include multi-server support, MCP prompts, agent mode, human-in-the-loop tool
+    execution, advanced model configuration, fuzzy autocomplete, performance metrics, and
+    streaming responses.</p>
+  </description>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/jonigl/mcp-client-for-ollama</url>
+  <developer>
+    <id>io.github.jonigl</id>
+    <name>jonigl</name>
+  </developer>
+  <provides>
+    <binary>ollmcp</binary>
+  </provides>
+  <releases>
+    <release version="0.28.0" date="2026-05-02"/>
+  </releases>
+  <categories>
+    <category>ConsoleOnly</category>
+    <category>Utility</category>
+  </categories>
+</component>
