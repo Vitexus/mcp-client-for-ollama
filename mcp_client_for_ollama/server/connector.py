@@ -13,7 +13,7 @@ from rich.panel import Panel
 from mcp import ClientSession, Tool
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
 
 from .discovery import process_server_paths, process_server_urls, parse_server_configs, auto_discover_servers
 from ..utils.constants import MCP_PROTOCOL_VERSION
