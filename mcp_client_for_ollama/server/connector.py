@@ -158,7 +158,7 @@ class ServerConnector:
                 read_stream, write_stream = sse_transport
                 session = await self.exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
 
-            elif server_type == "streamable_http":
+            elif server_type in ("streamable_http", "http"):
                 # Connect to Streamable HTTP server
                 url = self._get_url_from_server(server)
                 if not url:
@@ -221,8 +221,7 @@ class ServerConnector:
                         tool_copy = Tool(
                             name=qualified_name,
                             description=f"[{server_name}] {tool.description}" if hasattr(tool, 'description') else f"Tool from {server_name}",
-                            inputSchema=tool.inputSchema,
-                            outputSchema=tool.outputSchema if hasattr(tool, 'outputSchema') else None
+                            input_schema=tool.input_schema,
                         )
                         server_tools.append(tool_copy)
                         self.enabled_tools[qualified_name] = True
