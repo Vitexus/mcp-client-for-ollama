@@ -9,8 +9,8 @@ import os
 from typing import Dict, Any, Optional
 from rich.console import Console
 from rich.panel import Panel
-from ..utils.constants import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_FILE
-from .defaults import default_config
+from ..utils.constants import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_FILE, REASONING_EFFORT_LEVELS
+from .defaults import default_config, default_provider_profile
 
 class ConfigManager:
     """Manages configuration for the MCP Client for Ollama.
@@ -151,6 +151,7 @@ class ConfigManager:
             "• Context retention enabled\n"
             "• Thinking mode enabled\n"
             "• Thinking text visible\n"
+            "• Reasoning effort reset to medium\n"
             "• Agent loop limit reset",
             title="Config Reset", border_style="green", expand=False
         ))
@@ -197,17 +198,35 @@ class ConfigManager:
         # Start with default configuration
         validated = default_config()
 
-        # Remove default host - only include if explicitly in config file
-        # This allows CLI arguments to take precedence when config file
-        # doesn't have a host field (e.g., older config files)
-        del validated["host"]
+        # Resolve per-provider connection profiles.
+        # New format: a "providers" map keyed by provider name plus a
+        # "defaultProvider". Legacy format: flat top-level host/model/provider/
+        # apiKey, which we migrate into a single provider profile so old config
+        # files keep working and are rewritten in the new shape on next save.
+        validated["providers"] = {}
+        if isinstance(config_data.get("providers"), dict):
+            default_provider = config_data.get("defaultProvider") or "ollama"
+            for name, profile in config_data["providers"].items():
+                if isinstance(profile, dict):
+                    validated["providers"][name] = {
+                        "host": profile.get("host", ""),
+                        "model": profile.get("model", ""),
+                        "apiKey": profile.get("apiKey", ""),
+                    }
+        elif any(k in config_data for k in ("host", "model", "provider", "apiKey")):
+            default_provider = config_data.get("provider") or "ollama"
+            validated["providers"][default_provider] = {
+                "host": config_data.get("host", ""),
+                "model": config_data.get("model", ""),
+                "apiKey": config_data.get("apiKey", ""),
+            }
+        else:
+            default_provider = "ollama"
 
-        # Apply values from the loaded configuration if they exist
-        if "host" in config_data:
-            validated["host"] = config_data["host"]
-
-        if "model" in config_data:
-            validated["model"] = config_data["model"]
+        # Ensure the default provider always has at least a seed profile.
+        if default_provider not in validated["providers"]:
+            validated["providers"][default_provider] = default_provider_profile(default_provider)
+        validated["defaultProvider"] = default_provider
 
         if "enabledTools" in config_data and isinstance(config_data["enabledTools"], dict):
             validated["enabledTools"] = config_data["enabledTools"]
@@ -221,6 +240,10 @@ class ConfigManager:
                 validated["modelSettings"]["thinkingMode"] = bool(config_data["modelSettings"]["thinkingMode"])
             if "showThinking" in config_data["modelSettings"]:
                 validated["modelSettings"]["showThinking"] = bool(config_data["modelSettings"]["showThinking"])
+            if "reasoningEffort" in config_data["modelSettings"]:
+                effort = str(config_data["modelSettings"]["reasoningEffort"]).lower()
+                if effort in REASONING_EFFORT_LEVELS:
+                    validated["modelSettings"]["reasoningEffort"] = effort
 
         if "agentSettings" in config_data and isinstance(config_data["agentSettings"], dict):
             if "loopLimit" in config_data["agentSettings"]:
@@ -273,7 +296,7 @@ class ConfigManager:
                 validated["displaySettings"]["showMetrics"] = bool(config_data["displaySettings"]["showMetrics"])
             if "answerRenderMode" in config_data["displaySettings"]:
                 answer_render_mode = str(config_data["displaySettings"]["answerRenderMode"]).lower()
-                if answer_render_mode in {"plain", "markdown", "both"}:
+                if answer_render_mode in {"plain", "markdown", "both", "blocks"}:
                     validated["displaySettings"]["answerRenderMode"] = answer_render_mode
 
         if "inputSettings" in config_data and isinstance(config_data["inputSettings"], dict):

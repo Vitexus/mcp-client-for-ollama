@@ -1,5 +1,6 @@
 """MCP Client for Ollama - A TUI client for interacting with Ollama models and MCP servers"""
 import asyncio
+import json
 import os
 import sys
 import select
@@ -21,16 +22,22 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.text import Text
-import ollama
 import httpx
+from any_llm import AnyLLM
+from any_llm.exceptions import MissingApiKeyError
 
 from . import __version__
 from .config.manager import ConfigManager
+from .config.defaults import default_config, default_provider_profile
 from .utils.version import check_for_updates
-from .utils.constants import DEFAULT_CLAUDE_CONFIG, DEFAULT_MODEL, DEFAULT_OLLAMA_HOST, DEFAULT_COMPLETION_STYLE, DEFAULT_HISTORY_DISPLAY_LIMIT, MAX_COMPLETION_MENU_ROWS, OLLMCP_ASCII_ART
-from .utils.connection import preflight_ollama
+from .utils.constants import DEFAULT_CLAUDE_CONFIG, DEFAULT_MODEL, DEFAULT_OLLAMA_HOST, DEFAULT_PROVIDER, SUPPORTED_PROVIDERS, DEFAULT_COMPLETION_STYLE, DEFAULT_HISTORY_DISPLAY_LIMIT, MAX_COMPLETION_MENU_ROWS, OLLMCP_ASCII_ART, REASONING_EFFORT_LEVELS, DEFAULT_REASONING_EFFORT
+from .utils.connection import preflight_ollama, validate_provider
+from .utils.images import apply_images
 from .server.connector import ServerConnector
+from .server import registry
+from .server.cli_commands import mcp_app
 from .models.manager import ModelManager
 from .models.config_manager import ModelConfigManager
 from .tools.manager import ToolManager
@@ -38,6 +45,9 @@ from .prompts.manager import PromptManager
 from .prompts.handler import PromptHandler
 from .prompts.commands import run_slash_command
 from .prompts.routing import parse_user_input
+from .resources.manager import ResourceManager
+from .resources.handler import ResourceHandler
+from .resources.parser import extract_resource_refs
 from .utils.streaming import StreamingManager
 from .utils.tool_display import ToolDisplayManager
 from .utils.hil_manager import HumanInTheLoopManager, AbortQueryException
@@ -57,6 +67,7 @@ class MCPClient:
         "plain": "Plain",
         "markdown": "Markdown",
         "both": "Both",
+        "blocks": "Markdown (blocks)",
     }
 
     INPUT_MODE_LABELS = {
@@ -64,17 +75,22 @@ class MCPClient:
         "multiline": "Multiline",
     }
 
-    def __init__(self, model: str = DEFAULT_MODEL, host: str = DEFAULT_OLLAMA_HOST):
+    def __init__(self, model: str = DEFAULT_MODEL, host: str = DEFAULT_OLLAMA_HOST, provider: str = DEFAULT_PROVIDER, api_key: str = None, persist_api_key: bool = True):
         # Initialize session and client objects
         self.exit_stack = AsyncExitStack()
         self.host = host
-        self.ollama = ollama.AsyncClient(host=host)
+        self.provider = provider
+        self.api_key = api_key or ""
+        # Whether this key may be written to the config file. Keys coming from the
+        # OLLMCP_API_KEY env var (or a provider's native env var) are never persisted.
+        self.persist_api_key = persist_api_key
+        self.llm = AnyLLM.create(provider, api_key=api_key, api_base=host)
         self.console = Console()
         self.config_manager = ConfigManager(self.console)
         # Initialize the server connector
         self.server_connector = ServerConnector(self.exit_stack, self.console)
         # Initialize the model manager
-        self.model_manager = ModelManager(console=self.console, default_model=model, ollama=self.ollama)
+        self.model_manager = ModelManager(console=self.console, default_model=model, llm=self.llm, provider=provider, api_base=host, api_key=api_key or "")
         # Initialize the model config manager
         self.model_config_manager = ModelConfigManager(console=self.console)
         # Initialize the tool manager with server connector reference
@@ -83,6 +99,10 @@ class MCPClient:
         self.prompt_manager = PromptManager(console=self.console)
         # Initialize the prompt handler
         self.prompt_handler = PromptHandler(console=self.console, prompt_manager=self.prompt_manager)
+        # Initialize the resource manager
+        self.resource_manager = ResourceManager(console=self.console)
+        # Initialize the resource handler
+        self.resource_handler = ResourceHandler(console=self.console, resource_manager=self.resource_manager, server_connector=self.server_connector)
         # Initialize the streaming manager
         self.streaming_manager = StreamingManager(console=self.console)
         # Initialize the tool display manager
@@ -102,25 +122,29 @@ class MCPClient:
         # Thinking mode settings
         self.thinking_mode = True  # By default, thinking mode is enabled for models that support it
         self.show_thinking = True   # By default, thinking text is visible after completion
+        self.reasoning_effort = DEFAULT_REASONING_EFFORT  # Effort level sent when thinking mode is on
         # Tool display settings
         self.show_tool_execution = True  # By default, show tool execution displays
         # Metrics display settings
         self.show_metrics = False  # By default, don't show metrics after each query
-        self.answer_render_mode = "both"  # Show plain streaming output and final markdown by default
+        self.answer_render_mode = "both"  # Default to the safest mode (options: plain, markdown, both, blocks)
         self.input_mode = "single"  # Keep chat input single-line by default
         self.multiline_key_bindings = self._build_multiline_key_bindings()
         # Agent mode settings
-        self.loop_limit = 3  # Maximum follow-up tool loops per query
+        self.loop_limit = 7  # Maximum follow-up tool loops per query
         self.default_configuration_status = False  # Track if default configuration was loaded successfully
+        self.model_resolution_status = None  # "no-models" | "auto-selected" | None, set during startup
         self.abort_current_query = False  # Flag to abort the current query execution
         self.monitor_paused = False  # Flag to pause cancellation monitoring
         self.monitor_paused_ack = asyncio.Event()  # Event to acknowledge pause
+        # Buffer of resources loaded via @uri, injected as context before the next query
+        self.pending_resources: List[dict] = []
 
         # Store server connection parameters for reloading
         self.server_connection_params = {
             'server_paths': None,
             'config_path': None,
-            'auto_discovery': False
+            'claude_desktop': False
         }
 
     @contextmanager
@@ -137,6 +161,25 @@ class MCPClient:
         except Exception:
             self.chat_history = backup
             raise
+
+    def _warn_vision_not_supported(self, image_count: int, source: str):
+        """Display a warning panel when images cannot be processed by the current model.
+
+        Args:
+            image_count: Number of images that were skipped.
+            source: Description of where the images came from (e.g. tool name, 'resource').
+        """
+        current_model = self.model_manager.get_current_model()
+        image_label = "image" if image_count == 1 else "images"
+        self.console.print(Panel(
+            f"[yellow]{source} returned {image_count} {image_label}, "
+            f"but the current model [cyan]{current_model}[/cyan] does not support vision.[/yellow]\n\n"
+            "The images have been skipped. To process images, switch to a vision-capable model.",
+            border_style="yellow",
+            title="[bold yellow]Vision Not Supported[/bold yellow]",
+            expand=False,
+            padding=(1, 2)
+        ))
 
     def _build_multiline_key_bindings(self):
         """Build key bindings for multiline chat input."""
@@ -206,11 +249,20 @@ class MCPClient:
 
         self.prompt_session = self._create_chat_prompt_session(completer=completer)
 
-    async def _process_query_with_monitoring(self, query: str):
+    @staticmethod
+    def _make_resource_context_entry(r: dict) -> dict:
+        """Build a chat-history entry that injects a resource as a user/assistant turn."""
+        return {
+            'query': f"I'm providing the content of resource '{r['uri']}':\n\n{r['text']}",
+            'response': f"I've received the content of '{r['uri']}'. I'll use it to answer your next message."
+        }
+
+    async def _process_query_with_monitoring(self, query: str, images=None):
         """Process a query with cancellation monitoring
 
         Args:
             query: The query to process
+            images: Optional list of base64 image strings for vision models
         """
         # Reset HIL session state for new query
         self.hil_manager.reset_session()
@@ -221,7 +273,7 @@ class MCPClient:
         self.monitor_paused_ack.clear()
 
         # Create tasks for query processing and cancellation monitoring
-        query_task = asyncio.create_task(self.process_query(query))
+        query_task = asyncio.create_task(self.process_query(query, images=images))
         monitor_task = asyncio.create_task(self.monitor_cancellation())
 
         try:
@@ -260,7 +312,10 @@ class MCPClient:
 
     def display_current_model(self):
         """Display the currently selected model"""
-        self.model_manager.display_current_model()
+        self.model_manager.display_current_model(
+            thinking_mode=self.thinking_mode,
+            reasoning_effort=self.reasoning_effort,
+        )
 
     async def supports_thinking_mode(self) -> bool:
         """Check if the current model supports thinking mode by checking its capabilities
@@ -271,16 +326,38 @@ class MCPClient:
         try:
             current_model = self.model_manager.get_current_model()
             # Query the model's capabilities using ollama.show()
-            model_info = await self.ollama.show(current_model)
-
-            # Check if the model has 'thinking' capability
-            if 'capabilities' in model_info and model_info['capabilities']:
-                return 'thinking' in model_info['capabilities']
-
-            return False
+            caps = await self.model_manager.fetch_capabilities(current_model)
+            return 'thinking' in caps
         except Exception:
-            # If we can't determine capabilities, assume no thinking support
             return False
+
+    async def supports_vision(self) -> bool:
+        """Check if the current model supports vision (image) input
+
+        Returns:
+            bool: True if the current model supports vision, False otherwise
+        """
+        try:
+            current_model = self.model_manager.get_current_model()
+            caps = await self.model_manager.fetch_capabilities(current_model)
+            return 'vision' in caps
+        except Exception:
+            return False
+
+    def _reasoning_effort_kwargs(self, supports_thinking: bool) -> dict:
+        """Return the reasoning_effort kwarg for acompletion, or {} when thinking is off/unsupported.
+
+        For Ollama, any-llm maps concrete levels to think="low"/"medium"/"high" and treats
+        "auto" as no explicit think override (model default). Since thinking_mode=True means
+        the user wants thinking, we substitute "high" for Ollama+auto to guarantee think is set.
+        Cloud providers receive the level as-is including "auto" (provider's own default effort).
+        """
+        if not (supports_thinking and self.thinking_mode):
+            return {}
+        effort = self.reasoning_effort
+        if self.provider == "ollama" and effort == "auto":
+            effort = "high"
+        return {"reasoning_effort": effort}
 
     async def select_model(self):
         """Let the user select an Ollama model from the available ones"""
@@ -288,6 +365,7 @@ class MCPClient:
 
         # After model selection, redisplay context
         self.display_available_tools()
+        await self.model_manager.fetch_capabilities(self.model_manager.get_current_model())
         self.display_current_model()
         self._display_chat_history()
 
@@ -323,29 +401,32 @@ class MCPClient:
         """Display available tools with their enabled/disabled status"""
         self.tool_manager.display_available_tools()
 
-    async def connect_to_servers(self, server_paths=None, server_urls=None, config_path=None, auto_discovery=False):
+    async def connect_to_servers(self, server_paths=None, server_urls=None, config_path=None, claude_desktop=False, server_configs=None):
         """Connect to one or more MCP servers using the ServerConnector
 
         Args:
             server_paths: List of paths to server scripts (.py or .js)
             server_urls: List of URLs for SSE or Streamable HTTP servers
             config_path: Path to JSON config file with server configurations
-            auto_discovery: Whether to automatically discover servers
+            claude_desktop: Whether to load servers from Claude Desktop's config
+            server_configs: Pre-built ``mcpServers`` mapping ({name: entry})
         """
         # Store connection parameters for potential reload
         self.server_connection_params = {
             'server_paths': server_paths,
             'server_urls': server_urls,
             'config_path': config_path,
-            'auto_discovery': auto_discovery
+            'claude_desktop': claude_desktop,
+            'server_configs': server_configs
         }
 
         # Connect to servers using the server connector
-        sessions, available_tools, enabled_tools, prompts_by_server = await self.server_connector.connect_to_servers(
+        sessions, available_tools, enabled_tools, prompts_by_server, resources_by_server, templates_by_server = await self.server_connector.connect_to_servers(
             server_paths=server_paths,
             server_urls=server_urls,
             config_path=config_path,
-            auto_discovery=auto_discovery
+            claude_desktop=claude_desktop,
+            server_configs=server_configs
         )
 
         # Store the results
@@ -358,10 +439,16 @@ class MCPClient:
         # Set up the prompt manager with available prompts
         self.prompt_manager.set_prompts(prompts_by_server)
 
-        # Update the FZF completer with available prompts
+        # Set up the resource manager with available resources and templates
+        self.resource_manager.set_resources(resources_by_server)
+        self.resource_manager.set_templates(templates_by_server)
+
+        # Update the FZF completer with available prompts, resources, and templates
         if self.prompt_session and self.prompt_session.completer:
             prompt_list = self.prompt_manager.list_all()
             self.prompt_session.completer.set_prompts(prompt_list)
+            self.prompt_session.completer.set_resources(self.resource_manager.list_all())
+            self.prompt_session.completer.set_resource_templates(self.resource_manager.list_all_templates())
 
     def select_tools(self):
         """Let the user select which tools to enable using interactive prompts with server-based grouping"""
@@ -392,6 +479,9 @@ class MCPClient:
             history_to_show = self.chat_history[-max_history:]
 
             for i, entry in enumerate(history_to_show):
+                # Skip resource context entries (not real conversation turns)
+                if entry["query"].startswith("I'm providing the content of resource '"):
+                    continue
                 # Calculate query number starting from 1 for the first query
                 query_number = len(self.chat_history) - len(history_to_show) + i + 1
                 self.console.print(f"[bold green]Query {query_number}:[/bold green]")
@@ -403,13 +493,24 @@ class MCPClient:
             if len(self.chat_history) > max_history:
                 self.console.print(f"[dim](Showing last {max_history} of {len(self.chat_history)} conversations)[/dim]")
 
-    async def process_query(self, query: str) -> str:
+    async def process_query(self, query: str, images=None) -> str:
         """Process a query using Ollama and available tools"""
+        if not self.model_manager.get_current_model():
+            self.console.print(Panel(
+                "[bold yellow]No model selected.[/bold yellow]\n\n"
+                "Pull one in another terminal with [bold cyan]ollama pull <model>[/bold cyan], then choose it with "
+                "[bold cyan]/model[/bold cyan] or [bold cyan]/m[/bold cyan].",
+                title="No Model Available", border_style="yellow", expand=False
+            ))
+            return ""
+
         # Create base message with current query
         current_message = {
             "role": "user",
             "content": query
         }
+        if images:
+            current_message["images"] = images
 
         # Build messages array based on context retention setting
         if self.retain_context and self.chat_history:
@@ -421,11 +522,12 @@ class MCPClient:
                     "role": "user",
                     "content": entry["query"]
                 })
-                # Add assistant response
-                messages.append({
-                    "role": "assistant",
-                    "content": entry["response"]
-                })
+                # Add assistant response only if it's not empty
+                if entry["response"]:
+                    messages.append({
+                        "role": "assistant",
+                        "content": entry["response"]
+                    })
             # Add the current query
             messages.append(current_message)
         else:
@@ -458,25 +560,22 @@ class MCPClient:
         # Get current model from the model manager
         model = self.model_manager.get_current_model()
 
-        # Get model options in Ollama format
-        model_options = self.model_config_manager.get_ollama_options()
-
-        # Prepare chat parameters
-        chat_params = {
-            "model": model,
-            "messages": messages,
-            "stream": True,
-            "tools": available_tools,
-            "options": model_options
-        }
-
         # Add thinking parameter if thinking mode is enabled and model supports it
         supports_thinking = await self.supports_thinking_mode()
-        if supports_thinking:
-            chat_params["think"] = self.thinking_mode
 
-        # Initial Ollama API call with the query and available tools
-        stream = await self.ollama.chat(**chat_params)
+        # Check vision capability once for the entire query
+        has_vision = await self.supports_vision()
+
+        # Initial LLM API call with the query and available tools
+        stream = await self.llm.acompletion(
+            model=model,
+            messages=apply_images(messages),
+            stream=True,
+            stream_options={"include_usage": True},
+            tools=available_tools or None,
+            **self._reasoning_effort_kwargs(supports_thinking),
+            **self.model_config_manager.get_completion_kwargs(self.provider),
+        )
 
         # Process the streaming response with thinking mode support
         response_text = ""
@@ -502,8 +601,8 @@ class MCPClient:
         })
 
         # Update actual token count from metrics if available
-        if metrics and metrics.get('eval_count'):
-            self.actual_token_count += metrics['eval_count']
+        if metrics and metrics.get('completion_tokens'):
+            self.actual_token_count += metrics['completion_tokens']
 
         enabled_tools = self.tool_manager.get_enabled_tool_objects()
         tool_schema_map = {
@@ -512,6 +611,8 @@ class MCPClient:
         }
 
         loop_count = 0
+        iteration_budget = self.loop_limit
+        loop_unlimited = False
         pending_tool_calls = tool_calls
 
         # Keep looping while the model requests tools and we have capacity
@@ -519,20 +620,29 @@ class MCPClient:
             if self.abort_current_query:
                 break
 
-            if loop_count >= self.loop_limit:
-                self.console.print(Panel(
-                    f"[yellow]Your current loop limit is set to [bold]{self.loop_limit}[/bold] and has been reached. Skipping additional tool calls.[/yellow]\n"
-                    f"You will probably want to increase this limit if your model requires more tool interactions to complete tasks.\n"
-                    f"You can change the loop limit with the [bold cyan]/loop-limit[/bold cyan] command.",
-                    title="[bold]Loop Limit Reached[/bold]", border_style="yellow", expand=False
-                ))
-                break
+            if not loop_unlimited and loop_count >= iteration_budget:
+                action, amount = await self._prompt_loop_limit_action(iteration_budget)
+                if action == "continue":
+                    iteration_budget += amount
+                elif action == "unlimited":
+                    loop_unlimited = True
+                elif action == "wrap":
+                    wrap_text = await self._wrap_up_final_answer(
+                        messages, model, pending_tool_calls, supports_thinking
+                    )
+                    if wrap_text:
+                        response_text = wrap_text
+                    break
+                elif action == "abort":
+                    self.abort_current_query = True
+                    raise AbortQueryException("Query aborted at loop limit")
 
             loop_count += 1
 
             for tool in pending_tool_calls:
-                tool_name = tool.function.name
-                raw_tool_args = tool.function.arguments
+                tool_name = tool["function"]["name"]
+                tool_call_id = tool["id"]
+                raw_tool_args = tool["function"]["arguments"]
 
                 try:
                     tool_args = normalize_tool_arguments(raw_tool_args)
@@ -543,7 +653,7 @@ class MCPClient:
                     messages.append({
                         "role": "tool",
                         "content": error_msg,
-                        "tool_name": tool_name
+                        "tool_call_id": tool_call_id
                     })
                     continue
 
@@ -584,7 +694,7 @@ class MCPClient:
                     messages.append({
                         "role": "tool",
                         "content": tool_response,
-                        "tool_name": tool_name
+                        "tool_call_id": tool_call_id
                     })
                     continue
 
@@ -600,36 +710,90 @@ class MCPClient:
                         messages.append({
                             "role": "tool",
                             "content": error_msg,
-                            "tool_name": tool_name
+                            "tool_call_id": tool_call_id
                         })
                         # Continue with next tool call if any
                         continue
 
-                tool_response = f"{result.content[0].text}"
+                # Extract content from tool response - decoupled from display
+                # MCP responses can contain multiple content items (text, images, etc.)
+                text_parts = []
+                tool_images = []  # List of base64 strings
 
-                # Display the tool response
-                self.tool_display_manager.display_tool_response(tool_name, tool_args, tool_response, show=self.show_tool_execution)
+                for content_item in result.content:
+                    if hasattr(content_item, 'type') and content_item.type == "image":
+                        base64_data = getattr(content_item, 'data', '')
+                        mime_type = getattr(content_item, 'mimeType', 'unknown')
+                        tool_images.append(base64_data)
+                        if has_vision:
+                            text_parts.append(f"[Image: {mime_type}, {len(base64_data)} bytes]")
+                        else:
+                            text_parts.append(f"[Image returned but not processed: {mime_type} - current model does not support vision]")
+                    elif hasattr(content_item, 'type') and content_item.type == "audio":
+                        mime_type = getattr(content_item, 'mimeType', 'unknown')
+                        data = getattr(content_item, 'data', '')
+                        text_parts.append(f"[Audio returned but not processed: {mime_type}, {len(data)} bytes - Ollama does not support audio input]")
+                    elif hasattr(content_item, 'type') and content_item.type == "resource" and hasattr(content_item, 'resource'):
+                        # TODO: Handle MCP resource content (type="resource") — extract text/blob from
+                        #       content_item.resource and forward to LLM once resource support is implemented.
+                        resource = content_item.resource
+                        uri = getattr(resource, 'uri', 'unknown')
+                        mime_type = getattr(resource, 'mimeType', 'unknown')
+                        text_parts.append(f"[Resource returned but not processed: {uri} ({mime_type}) - resource support not yet implemented]")
+                    elif hasattr(content_item, 'type') and content_item.type == "resource_link":
+                        # TODO: Handle MCP resource links (type="resource_link") — fetch content via
+                        #       resources/read using the URI once resource support is implemented.
+                        uri = getattr(content_item, 'uri', 'unknown')
+                        name = getattr(content_item, 'name', '')
+                        mime_type = getattr(content_item, 'mimeType', 'unknown')
+                        label = f" ({name})" if name else ""
+                        text_parts.append(f"[Resource link returned but not fetched: {uri}{label} ({mime_type}) - resource support not yet implemented]")
+                    elif hasattr(content_item, 'text'):
+                        text_parts.append(str(content_item.text))
+                    else:
+                        text_parts.append(str(content_item))
 
-                messages.append({
+                tool_response = "\n\n".join(text_parts) if text_parts else "Tool executed successfully (no text content returned)"
+
+                # Display tool response (independent of content extraction)
+                self.tool_display_manager.display_tool_response(
+                    tool_name, tool_args, tool_response,
+                    show=self.show_tool_execution, image_count=len(tool_images),
+                    vision_supported=has_vision
+                )
+
+                # Build tool message for LLM
+                tool_message = {
                     "role": "tool",
                     "content": tool_response,
-                    "tool_name": tool_name
-                })
+                    "tool_call_id": tool_call_id
+                }
 
-            # Get stream response from Ollama with the tool results
-            chat_params_followup = {
-                "model": model,
-                "messages": messages,
-                "stream": True,
-                "tools": available_tools,
-                "options": model_options
-            }
+                messages.append(tool_message)
 
-            # Add thinking parameter if thinking mode is enabled and model supports it
-            if supports_thinking:
-                chat_params_followup["think"] = self.thinking_mode
+                # Ollama only processes images on user-role messages, so we
+                # must use role:"user" even though the images came from a tool.
+                # The content makes this clear to the model.
+                if tool_images and has_vision:
+                    messages.append({
+                        "role": "user",
+                        "content": f"Here are the images returned by the tool {tool_name}. Describe or use them based on the original query.",
+                        "images": tool_images
+                    })
+                elif tool_images and not has_vision:
+                    self._warn_vision_not_supported(len(tool_images), f"The tool '{tool_name}'")
 
-            stream = await self.ollama.chat(**chat_params_followup)
+
+            # Get stream response from LLM with the tool results
+            stream = await self.llm.acompletion(
+                model=model,
+                messages=apply_images(messages),
+                stream=True,
+                stream_options={"include_usage": True},
+                tools=available_tools or None,
+                **self._reasoning_effort_kwargs(supports_thinking),
+                **self.model_config_manager.get_completion_kwargs(self.provider),
+            )
 
             # Process the streaming response with thinking mode support
             followup_response, pending_tool_calls, followup_metrics = await self.streaming_manager.process_streaming_response(
@@ -651,8 +815,8 @@ class MCPClient:
             })
 
             # Update actual token count from followup metrics if available
-            if followup_metrics and followup_metrics.get('eval_count'):
-                self.actual_token_count += followup_metrics['eval_count']
+            if followup_metrics and followup_metrics.get('completion_tokens'):
+                self.actual_token_count += followup_metrics['completion_tokens']
 
             if followup_response:
                 response_text = followup_response
@@ -660,7 +824,28 @@ class MCPClient:
             enabled_tools = self.tool_manager.get_enabled_tool_objects()
 
         if not response_text and not self.abort_current_query:
-            self.console.print("[red]No content response received.[/red]")
+            current_model = self.model_manager.get_current_model()
+            tool_count = len(self.tool_manager.get_enabled_tool_objects())
+            history_count = len(self.chat_history)
+            self.console.print()  # Add spacing before the panel
+            self.console.print(Panel(
+                f"[yellow]The model produced no response or tool calls.[/yellow]\n\n"
+                f"Current model: [cyan]{current_model}[/cyan] · "
+                f"Enabled tools: [cyan]{tool_count}[/cyan] · "
+                f"Conversation history: [cyan]{history_count}[/cyan] entries\n\n"
+                "[bold]Possible causes:[/bold]\n"
+                "• The model is too small for tool use (models <7B often fail to produce tool calls)\n"
+                "• Too many tools enabled — the tool descriptions may overwhelm the model's context\n"
+                "• Conversation history is too long — try [bold cyan]clear[/bold cyan] or [bold cyan]cc[/bold cyan] to reset context\n"
+                "• Tool descriptions are unclear — the model couldn't determine which tool to use\n\n"
+                "[bold]Things to try:[/bold]\n"
+                "• Switch to a larger model with [bold cyan]/model[/bold cyan] or [bold cyan]/m[/bold cyan] (7B+ recommended)\n"
+                "• Disable unneeded tools with [bold cyan]/tools[/bold cyan] or [bold cyan]/t[/bold cyan] to reduce context size\n"
+                "• Clear conversation history with [bold cyan]/clear[/bold cyan] or [bold cyan]/cc[/bold cyan]\n"
+                "• Use a model with thinking capability and enable it with [bold cyan]/thinking-mode[/bold cyan] or [bold cyan]/tm[/bold cyan]\n"
+                "• Rephrase your query to be more specific",
+                title="[yellow]No Response from Model[/yellow]", border_style="yellow", expand=False
+            ))
             response_text = ""
 
         # Append query and response to chat history
@@ -804,7 +989,8 @@ class MCPClient:
                     f"[bold yellow]New version available![/bold yellow]\n\n"
                     f"Current version: [cyan]{current_version}[/cyan]\n"
                     f"Latest version: [green]{latest_version}[/green]\n\n"
-                    f"Upgrade with: [bold white]pip install --upgrade mcp-client-for-ollama[/bold white]",
+                    f"Upgrade with: [bold white]uv tool install --upgrade ollmcp[/bold white]\n"
+                    f"Or if you prefer: [bold white]pip install --upgrade ollmcp[/bold white]",
                     title="Update Available", border_style="yellow", expand=False
                 ))
         except Exception:
@@ -816,13 +1002,17 @@ class MCPClient:
         self.clear_console()
         self.console.print(Panel(Text.from_markup("[bold green]Welcome to the MCP Client for Ollama 🦙[/bold green]", justify="center"), expand=True, border_style="green"))
         self.display_available_tools()
-        self.display_current_model()
+        if self.model_resolution_status != "no-models":
+            await self.model_manager.fetch_capabilities(self.model_manager.get_current_model())
+            self.display_current_model()
         self.print_startup_help()
         self.print_auto_load_default_config_status()
+        self.model_manager.print_resolution_status(self.model_resolution_status)
         await self.display_check_for_updates()
 
         while True:
             try:
+                self.console.print()  # Add spacing before the prompt
                 # Use await to call the async method
                 query = await self.get_user_input()
 
@@ -846,12 +1036,44 @@ class MCPClient:
                     await self.handle_prompt_invocation(value)
                     continue
 
-                # Reserved for future @ resource shortcuts. For now, send as normal query.
+                if intent == "resource" and value:
+                    known_uris = self.resource_manager.get_known_uris()
+                    clean_query, refs = extract_resource_refs(value, known_uris)
+                    if refs:
+                        await self._handle_inline_resources(clean_query, refs)
+                    continue
+
                 query_to_process = value
 
+                # Check for inline @resource refs in plain queries (e.g.
+                # "summarize @server://info").  The "resource" intent only
+                # fires when the input *starts* with '@'.
+                if '@' in query_to_process:
+                    known_uris = self.resource_manager.get_known_uris()
+                    clean_query, refs = extract_resource_refs(query_to_process, known_uris)
+                    if refs:
+                        await self._handle_inline_resources(clean_query, refs)
+                        continue
+
                 try:
-                    # Process query with monitoring
-                    await self._process_query_with_monitoring(query_to_process)
+                    # If resources were buffered (standalone @uri lines), inject as context
+                    if self.pending_resources:
+                        context_entries = [
+                            self._make_resource_context_entry(r)
+                            for r in self.pending_resources
+                        ]
+                        pending_images = [img for r in self.pending_resources for img in r.get('images', [])]
+                        self.pending_resources = []
+                        if pending_images and not await self.supports_vision():
+                            self._warn_vision_not_supported(len(pending_images), "The buffered resource(s)")
+                            pending_images = []
+                        with self._temporary_history_extension(context_entries):
+                            await self._process_query_with_monitoring(
+                                query, images=pending_images or None
+                            )
+                    else:
+                        # Process query with monitoring
+                        await self._process_query_with_monitoring(query_to_process)
 
                 except AbortQueryException:
                     # User aborted the query - don't save to history
@@ -875,7 +1097,7 @@ class MCPClient:
                         border_style="red", expand=False
                     ))
 
-                except ollama.ResponseError as e:
+                except Exception as e:
                     # Extract error message without the traceback
                     error_msg = str(e)
                     if "does not support tools" in error_msg.lower():
@@ -887,8 +1109,17 @@ class MCPClient:
                             title="Tools Not Supported",
                             border_style="red", expand=False
                         ))
+                    elif "401" in error_msg or "403" in error_msg or "unauthorized" in error_msg.lower():
+                        self.console.print(Panel(
+                            f"[bold red]Authentication Error:[/bold red] The [bold blue]{self.provider}[/bold blue] provider rejected the request.\n\n"
+                            + ("No API key is set. " if not self.api_key else "The API key may be invalid or lack access to this model. ")
+                            + "Set a valid key with [bold cyan]--api-key[/bold cyan] or [bold cyan]$OLLMCP_API_KEY[/bold cyan].\n\n"
+                            f"[dim]Provider response: {error_msg}[/dim]",
+                            title="Authentication Failed", border_style="red", expand=False
+                        ))
                     else:
-                        self.console.print(Panel(f"[bold red]Ollama Error:[/bold red] {error_msg}",
+                        self.console.print() # Add spacing before the panel
+                        self.console.print(Panel(f"[bold red]LLM Error:[/bold red] {error_msg}",
                                                  border_style="red", expand=False))
 
                     # If it's a "model not found" error, suggest how to fix it
@@ -917,6 +1148,7 @@ class MCPClient:
             "• Type [bold]/model-config[/bold] or [bold]/mc[/bold] to configure system prompt and model parameters\n"
             "• Type [bold]/thinking-mode[/bold] or [bold]/tm[/bold] to toggle thinking mode\n"
             "• Type [bold]/show-thinking[/bold] or [bold]/st[/bold] to toggle thinking text visibility\n"
+            "• Type [bold]/reasoning-effort[/bold] or [bold]/re[/bold] to set reasoning effort level (auto/minimal/low/medium/high/xhigh)\n"
             "• Type [bold]/show-metrics[/bold] or [bold]/sm[/bold] to toggle performance metrics display\n\n"
 
             "[bold cyan]Agent Mode:[/bold cyan] \n"
@@ -933,6 +1165,11 @@ class MCPClient:
             "• Type [bold]/server:prompt_name[/bold] to invoke an MCP server prompt\n"
             "• Type [bold]/prompt_name[/bold] when the prompt name is unique\n"
             "• Type [bold]/[/bold] to see prompt autocomplete suggestions\n\n"
+
+            "[bold bright_magenta](New!)[/bold bright_magenta] [bold cyan]MCP Resources:[/bold cyan]\n"
+            "• Type [bold]/resources[/bold] or [bold]/res[/bold] to browse available resources\n"
+            "• Type [bold]@resource_uri[/bold] to read a resource\n"
+            "• Type [bold]@[/bold] to see resource autocomplete suggestions\n\n"
 
             "[bold cyan]Context:[/bold cyan]\n"
             "• Type [bold]/context[/bold] or [bold]/c[/bold] to toggle context retention\n"
@@ -959,12 +1196,7 @@ class MCPClient:
             "• [dim]Shift+Enter and Meta+Enter may work in some terminals, but are not portable[/dim]\n"
             "• Type [bold]/help[/bold] or [bold]/h[/bold] to show this help message\n"
             "• Type [bold]/clear-screen[/bold] or [bold]/cls[/bold] to clear the terminal screen\n"
-            "• Type [bold]/quit[/bold], [bold]/q[/bold], [bold]/exit[/bold], [bold]/bye[/bold], [bold]Ctrl+C[/bold] or [bold]Ctrl+D[/bold] to exit the client\n\n"
-
-            "[bold bright_magenta]IMPORTANT NEW BEHAVIOR:[/bold bright_magenta]\n"
-            "Built-in commands now require [bold]/[/bold]\n"
-            "Examples: [bold]/help[/bold], [bold]/model[/bold], [bold]/tools[/bold], [bold]/prompts[/bold]\n"
-            "Prompt invocations also use slash: [bold]/server:prompt_name[/bold] (or [bold]/prompt_name[/bold] when unique)\n",
+            "• Type [bold]/quit[/bold], [bold]/q[/bold], [bold]/exit[/bold], [bold]/bye[/bold], [bold]Ctrl+C[/bold] or [bold]Ctrl+D[/bold] to exit the client\n",
             title="[bold]Help - Available Commands[/bold]", border_style="yellow", expand=False))
 
     def print_startup_help(self):
@@ -975,14 +1207,11 @@ class MCPClient:
             "• Type [bold]/model[/bold] or [bold]/m[/bold] to select a model\n"
             "• Type [bold]/tools[/bold] or [bold]/t[/bold] to configure tools\n"
             "• Type [bold]/server:prompt_name[/bold] to invoke an MCP server prompt\n"
+            "• [bold bright_magenta](New!)[/bold bright_magenta] Type [bold]@resource_uri[/bold] to read a resource or [bold]@[/bold] for autocomplete suggestions\n"
             "• Type [bold]/input-mode[/bold] or [bold]/im[/bold] to switch single-line or multiline chat input\n"
             "• Type [bold]/clear[/bold] or [bold]/cc[/bold] to clear conversation context\n"
             "• Type [bold]/help[/bold] or [bold]/h[/bold] to see the [underline]full command list[/underline]\n"
-            "• Type [bold]/quit[/bold] or [bold]/q[/bold] to exit the client\n\n"
-            "[bold bright_magenta]IMPORTANT NEW BEHAVIOR:[/bold bright_magenta]\n"
-            "Built-in commands now require [bold]/[/bold]\n"
-            "Examples: [bold]/help[/bold], [bold]/model[/bold], [bold]/tools[/bold]\n"
-            "Prompt invocations also use slash: [bold]/server:prompt_name[/bold] (or [bold]/prompt_name[/bold] when unique)\n",
+            "• Type [bold]/quit[/bold] or [bold]/q[/bold] to exit the client\n",
             title="[bold]Startup Help[/bold]", border_style="yellow", expand=False))
 
     def print_welcome_ascii(self):
@@ -1051,6 +1280,54 @@ class MCPClient:
         else:
             self.console.print("[cyan]🧹 The reasoning process will be hidden, showing only the final answer.[/cyan]")
 
+    async def select_reasoning_effort(self):
+        """Select reasoning effort level used when thinking mode is active."""
+        level_labels = {
+            "auto": "Auto (provider default)",
+            "minimal": "Minimal",
+            "low": "Low",
+            "medium": "Medium",
+            "high": "High",
+            "xhigh": "Extreme (xhigh)",
+        }
+        numbered = list(REASONING_EFFORT_LEVELS)  # auto, minimal, low, medium, high, xhigh
+        options_map = {str(i + 1): lvl for i, lvl in enumerate(numbered)}
+        for lvl in numbered:
+            options_map[lvl] = lvl
+
+        while True:
+            menu_lines = "\n".join(
+                f"{i + 1}. [bold]{level_labels[lvl]}[/bold] [dim]({lvl})[/dim]"
+                for i, lvl in enumerate(numbered)
+            )
+            self.console.print(Panel(
+                f"\n{menu_lines}\n\n"
+                "[dim]Applies when thinking mode is on and the model supports thinking\n"
+                "Level support depends on the provider and model.\n"
+                "Type a number, a level name, or q to cancel.[/dim]",
+                title="[bold]🤔 Reasoning Effort[/bold]",
+                border_style="magenta",
+                expand=False,
+            ))
+            self.console.print(f"Current level: [bold magenta]{level_labels.get(self.reasoning_effort, self.reasoning_effort)}[/bold magenta]")
+            if not self.thinking_mode:
+                self.console.print("[yellow]Note: thinking mode is currently off — this preference will apply once enabled.[/yellow]")
+
+            selection = await get_input_no_autocomplete("Select reasoning effort")
+            normalized = selection.strip().lower()
+
+            if normalized in {"q", "quit"}:
+                self.console.print("[yellow]Reasoning effort unchanged.[/yellow]")
+                return
+
+            if normalized in options_map:
+                self.reasoning_effort = options_map[normalized]
+                label = level_labels.get(self.reasoning_effort, self.reasoning_effort)
+                self.console.print(f"[green]Reasoning effort set to {label}![/green]")
+                return
+
+            self.console.print(f"[red]Invalid selection. Choose 1–{len(numbered)}, a level name, or q.[/red]")
+
     def toggle_show_tool_execution(self):
         """Toggle whether tool execution displays are shown"""
         self.show_tool_execution = not self.show_tool_execution
@@ -1087,18 +1364,21 @@ class MCPClient:
             "1": ("plain", "Plain"),
             "2": ("markdown", "Markdown"),
             "3": ("both", "Both"),
+            "4": ("blocks", "Markdown (blocks)"),
             "plain": ("plain", "Plain"),
             "markdown": ("markdown", "Markdown"),
             "both": ("both", "Both"),
+            "blocks": ("blocks", "Markdown (blocks)"),
         }
 
         while True:
             self.console.print(Panel(
                 "\n"
-                "1. [bold]Plain[/bold] only\n"
-                "2. [bold]Markdown[/bold] only\n"
-                "3. [bold]Both[/bold] plain streaming and final markdown\n\n"
-                "[dim]Type 1, 2, 3, plain, markdown, both, or q to cancel.[/dim]",
+                "1. [bold]Plain only[/bold] [green](most stable)[/green]\n"
+                "2. [bold]Markdown only[/bold] [yellow](live; can flicker/duplicate lines with emojis or on resize)[/yellow]\n"
+                "3. [bold]Both[/bold] plain streaming and final markdown [green](more stable)[/green]\n"
+                "4. [bold]Markdown (blocks)[/bold] [cyan](stable; renders each block once it completes)[/cyan]\n\n"
+                "[dim]Type 1, 2, 3, 4, plain, markdown, both, blocks, or q to cancel.[/dim]",
                 title="[bold]📝 Answer Display Mode[/bold]",
                 border_style="cyan",
                 expand=False,
@@ -1122,11 +1402,13 @@ class MCPClient:
                     self.console.print("[cyan]Responses will stream once without the final markdown re-render.[/cyan]")
                 elif self.answer_render_mode == "markdown":
                     self.console.print("[cyan]Responses will render as markdown during streaming with throttled redraws.[/cyan]")
+                elif self.answer_render_mode == "blocks":
+                    self.console.print("[cyan]Responses will render as markdown one block at a time, append-only (no redraws).[/cyan]")
                 else:
                     self.console.print("[cyan]Responses will stream as plain text first, then re-render as markdown.[/cyan]")
                 return
 
-            self.console.print("[red]Invalid selection. Choose 1, 2, 3, plain, markdown, both, or q.[/red]")
+            self.console.print("[red]Invalid selection. Choose 1, 2, 3, 4, plain, markdown, both, blocks, or q.[/red]")
 
     async def select_input_mode(self):
         """Select how chat input should be entered."""
@@ -1177,6 +1459,118 @@ class MCPClient:
 
             self.console.print("[red]Invalid selection. Choose 1, 2, single, multiline, or q.[/red]")
 
+    async def _prompt_loop_limit_action(self, iteration_budget):
+        """Ask the user what to do when the agent loop limit is reached.
+
+        Returns (action, amount) where action is one of:
+          "continue"  — resume with iteration_budget increased by amount
+          "unlimited" — remove the cap for this query
+          "wrap"      — force a final tool-free answer
+          "abort"     — discard the turn
+        """
+        self.console.print()
+        self.console.print()
+        self.console.print(Panel(
+            f"[yellow]Loop limit of [bold]{iteration_budget}[/bold] reached after this batch.[/yellow]\n\n"
+            "[bold cyan]What would you like to do?[/bold cyan]\n"
+            f"  [green]c/continue[/green]  - Run another [bold]{self.loop_limit}[/bold] iterations (default)\n"
+            "  [cyan]n/number[/cyan]    - Choose how many more iterations to allow\n"
+            "  [magenta]u/unlimited[/magenta] - Remove the cap and run until the model stops\n"
+            "  [yellow]w/wrap[/yellow]      - Ask the model to summarise what it found so far\n"
+            "  [bold red]a/abort[/bold red]     - Discard this turn (nothing saved to history)",
+            title="[bold]Loop Limit Reached[/bold]", border_style="yellow", expand=False
+        ))
+
+        self.monitor_paused = True
+        if os.name != 'nt':
+            try:
+                await asyncio.wait_for(self.monitor_paused_ack.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        try:
+            choice = Prompt.ask(
+                "[bold]Choice[/bold]",
+                choices=["c", "continue", "n", "number", "u", "unlimited", "w", "wrap", "a", "abort"],
+                default="c",
+                show_choices=False,
+            ).lower()
+        finally:
+            self.monitor_paused = False
+
+        if choice in ("n", "number"):
+            raw = await get_input_no_autocomplete("How many more iterations?")
+            try:
+                extra = int((raw or "").strip())
+                if extra < 1:
+                    raise ValueError
+            except ValueError:
+                self.console.print(f"[yellow]Invalid number — granting {self.loop_limit} more iterations.[/yellow]")
+                extra = self.loop_limit
+            return ("continue", extra)
+
+        if choice in ("u", "unlimited"):
+            self.console.print("[magenta]🤖 Running without iteration cap for the rest of this query.[/magenta]")
+            return ("unlimited", 0)
+
+        if choice in ("w", "wrap"):
+            self.console.print("[cyan]🤖 Asking the model to wrap up with what it has gathered...[/cyan]")
+            return ("wrap", 0)
+
+        if choice in ("a", "abort"):
+            self.console.print("[bold red]🛑 Aborting query...[/bold red]")
+            return ("abort", 0)
+
+        # c / continue
+        self.console.print(f"[green]🤖 Granting {self.loop_limit} more iterations.[/green]")
+        return ("continue", self.loop_limit)
+
+    async def _wrap_up_final_answer(self, messages, model, pending_tool_calls, supports_thinking):
+        """Force one final tool-free completion so gathered context is not lost.
+
+        At the point this is called the last assistant message contains unanswered
+        tool_calls. Providers reject a follow-up call while those are dangling, so
+        we append synthetic skipped-tool responses first, then request a plain text
+        answer with tools=None.
+        """
+        for tool in pending_tool_calls:
+            messages.append({
+                "role": "tool",
+                "content": "Tool call skipped — loop limit reached.",
+                "tool_call_id": tool["id"],
+            })
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "Stop calling tools. Based on the information gathered so far, "
+                "give your best final answer now."
+            ),
+        })
+
+        stream = await self.llm.acompletion(
+            model=model,
+            messages=apply_images(messages),
+            stream=True,
+            stream_options={"include_usage": True},
+            tools=None,
+            **self._reasoning_effort_kwargs(supports_thinking),
+            **self.model_config_manager.get_completion_kwargs(self.provider),
+        )
+
+        wrap_text, _, wrap_metrics = await self.streaming_manager.process_streaming_response(
+            stream,
+            thinking_mode=self.thinking_mode,
+            show_thinking=self.show_thinking,
+            show_metrics=self.show_metrics,
+            answer_render_mode=self.answer_render_mode,
+            cancellation_check=lambda: self.abort_current_query,
+        )
+
+        if wrap_metrics and wrap_metrics.get("completion_tokens"):
+            self.actual_token_count += wrap_metrics["completion_tokens"]
+
+        return wrap_text
+
     async def set_loop_limit(self):
         """Configure the maximum number of follow-up tool loops per query."""
         user_input = await get_input_no_autocomplete(f"Set agent loop limit (current: {self.loop_limit})")
@@ -1200,10 +1594,11 @@ class MCPClient:
             self.console.print("[red]Invalid loop limit. Please enter a positive integer.[/red]")
 
     def clear_context(self):
-        """Clear conversation history and token count"""
+        """Clear conversation history, token count, and pending resource buffer"""
         original_history_length = len(self.chat_history)
         self.chat_history = []
         self.actual_token_count = 0
+        self.pending_resources = []
         self.console.print(f"[green]Context cleared! Removed {original_history_length} conversation entries.[/green]")
 
     def display_context_stats(self):
@@ -1215,6 +1610,7 @@ class MCPClient:
         if self.thinking_mode:
             thinking_status = f"Thinking mode: [green]Enabled[/green]\n"
             thinking_status += f"Show thinking text: [{'green' if self.show_thinking else 'red'}]{'Visible' if self.show_thinking else 'Hidden'}[/{'green' if self.show_thinking else 'red'}]\n"
+            thinking_status += f"Reasoning effort: [cyan]{self.reasoning_effort}[/cyan]\n"
         else:
             thinking_status = f"Thinking mode: [red]Disabled[/red]\n"
 
@@ -1236,7 +1632,9 @@ class MCPClient:
         """Automatically load the default configuration if it exists."""
         if self.config_manager.config_exists("default"):
             # self.console.print("[cyan]Default configuration found, loading...[/cyan]")
-            self.default_configuration_status = self.load_configuration("default")
+            # Connection identity (host/model/apiKey) is already resolved in
+            # async_main before the client was built, so only apply shared settings.
+            self.default_configuration_status = self.load_configuration("default", apply_connection=False)
 
     def print_auto_load_default_config_status(self):
         """Print the status of the auto-load default configuration."""
@@ -1250,17 +1648,34 @@ class MCPClient:
         Args:
             config_name: Optional name for the config (defaults to 'default')
         """
-        # Build config data
-        config_data = {
-            "host": self.host,
+        # Start from the existing config so other providers' profiles are kept,
+        # then update this provider's connection profile and the shared settings.
+        if self.config_manager.config_exists(config_name):
+            config_data = self.config_manager.load_configuration(config_name)
+        else:
+            config_data = default_config()
+
+        # Don't write env-var-sourced keys to disk; keep any previously saved key.
+        existing_profile = (config_data.get("providers") or {}).get(self.provider, {})
+        config_data.setdefault("providers", {})
+        config_data["providers"][self.provider] = {
+            "host": self.host or "",
             "model": self.model_manager.get_current_model(),
+            "apiKey": (self.api_key or "") if self.persist_api_key else existing_profile.get("apiKey", ""),
+        }
+        # Remember the last saved provider as the default for plain `ollmcp`.
+        config_data["defaultProvider"] = self.provider
+
+        # Shared settings (apply across all providers)
+        config_data.update({
             "enabledTools": self.tool_manager.get_enabled_tools(),
             "contextSettings": {
                 "retainContext": self.retain_context
             },
             "modelSettings": {
                 "thinkingMode": self.thinking_mode,
-                "showThinking": self.show_thinking
+                "showThinking": self.show_thinking,
+                "reasoningEffort": self.reasoning_effort
             },
             "agentSettings": {
                 "loopLimit": self.loop_limit
@@ -1277,16 +1692,20 @@ class MCPClient:
             "hilSettings": {
                 "enabled": self.hil_manager.is_enabled()
             }
-        }
+        })
 
         # Use the ConfigManager to save the configuration
         return self.config_manager.save_configuration(config_data, config_name)
 
-    def load_configuration(self, config_name=None):
+    def load_configuration(self, config_name=None, apply_connection=True):
         """Load tool configuration and model settings from a file
 
         Args:
             config_name: Optional name of the config to load (defaults to 'default')
+            apply_connection: When True, apply the active provider's saved
+                connection profile (host/model/apiKey). At startup this is set
+                to False because the connection identity is already resolved in
+                async_main (with CLI flags taking precedence over the profile).
 
         Returns:
             bool: True if loaded successfully, False otherwise
@@ -1297,16 +1716,23 @@ class MCPClient:
         if not config_data:
             return False
 
-        # Apply the loaded configuration
-        if "host" in config_data:
-            new_host = config_data["host"]
-            if new_host != self.host:
-                self.host = new_host
-                self.ollama = ollama.AsyncClient(host=new_host)
-                self.model_manager.ollama = self.ollama
-
-        if "model" in config_data:
-            self.model_manager.set_model(config_data["model"])
+        # Apply the active provider's saved connection profile. The provider
+        # itself is fixed for the session (chosen at startup), so we only update
+        # host/model/apiKey for self.provider.
+        if apply_connection:
+            profile = (config_data.get("providers") or {}).get(self.provider)
+            if profile:
+                new_host = profile.get("host") or self.host
+                new_key = profile.get("apiKey") or self.api_key
+                if new_host != self.host or new_key != self.api_key:
+                    self.host = new_host
+                    self.api_key = new_key
+                    self.llm = AnyLLM.create(self.provider, api_key=self.api_key, api_base=new_host)
+                    self.model_manager.llm = self.llm
+                    self.model_manager.api_base = new_host
+                    self.model_manager.api_key = self.api_key
+                if profile.get("model"):
+                    self.model_manager.set_model(profile["model"])
 
         # Load enabled tools if specified
         if "enabledTools" in config_data:
@@ -1332,6 +1758,10 @@ class MCPClient:
                 self.thinking_mode = config_data["modelSettings"]["thinkingMode"]
             if "showThinking" in config_data["modelSettings"]:
                 self.show_thinking = config_data["modelSettings"]["showThinking"]
+            if "reasoningEffort" in config_data["modelSettings"]:
+                effort = str(config_data["modelSettings"]["reasoningEffort"]).lower()
+                if effort in REASONING_EFFORT_LEVELS:
+                    self.reasoning_effort = effort
 
         if "agentSettings" in config_data:
             if "loopLimit" in config_data["agentSettings"]:
@@ -1353,7 +1783,7 @@ class MCPClient:
                 self.show_metrics = config_data["displaySettings"]["showMetrics"]
             if "answerRenderMode" in config_data["displaySettings"]:
                 answer_render_mode = str(config_data["displaySettings"]["answerRenderMode"]).lower()
-                if answer_render_mode in {"plain", "markdown", "both"}:
+                if answer_render_mode in {"plain", "markdown", "both", "blocks"}:
                     self.answer_render_mode = answer_render_mode
 
         if "inputSettings" in config_data:
@@ -1379,13 +1809,19 @@ class MCPClient:
         # Enable all tools in the server connector
         self.server_connector.enable_all_tools()
 
-        # Reset host from the default configuration
-        if "host" in config_data:
-            new_host = config_data["host"]
-            if new_host != self.host:
-                self.host = new_host
-                self.ollama = ollama.AsyncClient(host=new_host)
-                self.model_manager.ollama = self.ollama
+        # Reset the active provider's connection profile to its defaults.
+        # The provider itself stays fixed for the session.
+        profile = (config_data.get("providers") or {}).get(self.provider) or default_provider_profile(self.provider)
+        self.api_key = profile.get("apiKey", "")
+        new_host = profile.get("host") or None
+        if new_host != self.host:
+            self.host = new_host
+            self.llm = AnyLLM.create(self.provider, api_key=self.api_key, api_base=new_host)
+            self.model_manager.llm = self.llm
+            self.model_manager.api_base = new_host
+            self.model_manager.api_key = self.api_key
+        if profile.get("model"):
+            self.model_manager.set_model(profile["model"])
 
         # Reset context settings from the default configuration
         if "contextSettings" in config_data:
@@ -1404,17 +1840,22 @@ class MCPClient:
             else:
                 # Default show thinking to True if not specified
                 self.show_thinking = True
+            if "reasoningEffort" in config_data["modelSettings"]:
+                effort = str(config_data["modelSettings"]["reasoningEffort"]).lower()
+                self.reasoning_effort = effort if effort in REASONING_EFFORT_LEVELS else DEFAULT_REASONING_EFFORT
+            else:
+                self.reasoning_effort = DEFAULT_REASONING_EFFORT
 
         if "agentSettings" in config_data:
             if "loopLimit" in config_data["agentSettings"]:
                 try:
                     self.loop_limit = max(1, int(config_data["agentSettings"]["loopLimit"]))
                 except (TypeError, ValueError):
-                    self.loop_limit = 3
+                    self.loop_limit = 7
             else:
-                self.loop_limit = 3
+                self.loop_limit = 7
         else:
-            self.loop_limit = 3
+            self.loop_limit = 7
 
         # Reset display settings from the default configuration
         if "displaySettings" in config_data:
@@ -1430,7 +1871,7 @@ class MCPClient:
                 self.show_metrics = False
             if "answerRenderMode" in config_data["displaySettings"]:
                 answer_render_mode = str(config_data["displaySettings"]["answerRenderMode"]).lower()
-                if answer_render_mode in {"plain", "markdown", "both"}:
+                if answer_render_mode in {"plain", "markdown", "both", "blocks"}:
                     self.answer_render_mode = answer_render_mode
                 else:
                     self.answer_render_mode = "both"
@@ -1480,6 +1921,17 @@ class MCPClient:
         self.display_current_model()
         self._display_chat_history()
 
+    def browse_resources(self):
+        """Display all available resources grouped by server"""
+        self.clear_console()
+        self.resource_handler.browse_resources()
+
+        # Redisplay context
+        self.clear_console()
+        self.display_available_tools()
+        self.display_current_model()
+        self._display_chat_history()
+
     async def handle_prompt_invocation(self, user_input: str):
         """Handle prompt invocation via slash syntax.
 
@@ -1496,6 +1948,79 @@ class MCPClient:
             self._process_query_with_monitoring,
             self._temporary_history_extension
         )
+
+    async def _handle_inline_resources(
+        self, clean_query: str, refs
+    ):
+        """Fetch @uri resources extracted inline from a query and process it.
+
+        When ``clean_query`` is empty (the user typed only ``@uri`` tokens),
+        resources are buffered for the next query instead of being sent
+        immediately — preserving the existing standalone ``@uri`` workflow.
+
+        Args:
+            clean_query: User query with @uri tokens stripped out.
+            refs: List of :class:`~resources.parser.ResourceRef` namedtuples.
+        """
+        fetched = []  # List of {'uri': str, 'text': str, 'images': list}
+        for ref in refs:
+            uri = ref.uri
+            if ref.is_template:
+                resolved = await self.resource_handler.resolve_template_interactive(uri)
+                if resolved is None:
+                    return  # User cancelled the template resolution
+                uri = resolved
+
+            result = await self.resource_handler.read_resource(uri, self.sessions)
+            if result:
+                fetched.append({'uri': uri, 'text': result.text, 'images': result.images})
+
+        if not fetched:
+            return  # Nothing could be read
+
+        # Standalone @uri (no query text) → buffer for the next user query.
+        if not clean_query.strip():
+            self.pending_resources.extend(fetched)
+            count = len(self.pending_resources)
+            self.console.print(
+                f"[cyan]{count} resource(s) buffered. "
+                "Type your query, or include @another_uri inline.[/cyan]"
+            )
+            return
+
+        # Short query guard (reuse the same 5-char rule).
+        if len(clean_query.strip()) < 5:
+            self.console.print("[yellow]Query must be at least 5 characters long.[/yellow]")
+            return
+
+        # Build context history entries for each resource.
+        context_entries = [
+            self._make_resource_context_entry(r)
+            for r in fetched
+        ]
+        inline_images = [img for r in fetched for img in r['images']]
+
+        # Merge any already-buffered resources (added via earlier standalone @uri).
+        if self.pending_resources:
+            pending_entries = [
+                self._make_resource_context_entry(r)
+                for r in self.pending_resources
+            ]
+            inline_images += [img for r in self.pending_resources for img in r.get('images', [])]
+            self.pending_resources = []
+            context_entries = pending_entries + context_entries
+
+        if inline_images and not await self.supports_vision():
+            self._warn_vision_not_supported(len(inline_images), "The resource(s)")
+            inline_images = []
+
+        try:
+            with self._temporary_history_extension(context_entries):
+                await self._process_query_with_monitoring(
+                    clean_query, images=inline_images or None
+                )
+        except AbortQueryException:
+            self.console.print("[yellow]Query aborted.[/yellow]")
 
     async def reload_servers(self):
         """Reload all MCP servers with the same connection parameters"""
@@ -1520,7 +2045,8 @@ class MCPClient:
                 server_paths=self.server_connection_params['server_paths'],
                 server_urls=self.server_connection_params['server_urls'],
                 config_path=self.server_connection_params['config_path'],
-                auto_discovery=self.server_connection_params['auto_discovery']
+                claude_desktop=self.server_connection_params['claude_desktop'],
+                server_configs=self.server_connection_params.get('server_configs')
             )
 
             # Restore enabled tool states for tools that still exist
@@ -1543,9 +2069,12 @@ class MCPClient:
             ))
 
 app = typer.Typer(help="MCP Client for Ollama", context_settings={"help_option_names": ["-h", "--help"]})
+app.add_typer(mcp_app, name="mcp")
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
+
     # MCP Server Configuration
     mcp_server: Optional[List[str]] = typer.Option(
         None, "--mcp-server", "-s",
@@ -1562,22 +2091,32 @@ def main(
         help="Path to a JSON file with server configurations",
         rich_help_panel="MCP Server Configuration"
     ),
-    auto_discovery: bool = typer.Option(
-        False, "--auto-discovery", "-a",
-        help=f"Auto-discover servers from Claude's config at {DEFAULT_CLAUDE_CONFIG} - If no other options are provided, this will be enabled by default",
+    claude_desktop: bool = typer.Option(
+        False, "--claude-desktop",
+        help=f"Load servers from Claude Desktop's config at {DEFAULT_CLAUDE_CONFIG}. Merged with registry servers and any other flags.",
         rich_help_panel="MCP Server Configuration"
     ),
 
     # Ollama Configuration
-    model: str = typer.Option(
-        DEFAULT_MODEL, "--model", "-m",
-        help="Ollama model to use",
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m",
+        help="Ollama model to use. Defaults to your saved configuration's model, or the first available model.",
         rich_help_panel="Ollama Configuration"
     ),
     host: str = typer.Option(
         None, "--host", "-H",
-        help="Ollama host URL",
-        rich_help_panel="Ollama Configuration"
+        help="LLM host / API base URL. Defaults to Ollama's localhost:11434 for the ollama provider, or the provider's own default endpoint otherwise.",
+        rich_help_panel="LLM Configuration"
+    ),
+    provider: Optional[str] = typer.Option(
+        None, "--provider", "-p",
+        help="LLM provider (e.g., ollama, openai, deepseek, openrouter). Defaults to your saved configuration's provider, or ollama.",
+        rich_help_panel="LLM Configuration"
+    ),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key", "-k",
+        help="API key for the LLM provider. Also read from $OLLMCP_API_KEY (works with any --provider; not written to config). Not needed for ollama.",
+        rich_help_panel="LLM Configuration",
     ),
 
     # General Options
@@ -1588,20 +2127,19 @@ def main(
 ):
     """Run the MCP Client for Ollama with specified options."""
 
-    if version:
-        typer.echo(f"mcp-client-for-ollama {__version__}")
-        raise typer.Exit()
+    if ctx.invoked_subcommand is not None:
+        return
 
-    # If none of the server arguments are provided, enable auto-discovery
-    if not (mcp_server or mcp_server_url or servers_json or auto_discovery):
-        auto_discovery = True
+    if version:
+        typer.echo(f"ollmcp {__version__}")
+        raise typer.Exit()
 
     # Run the async main function with proper cleanup
     # Use manual loop management to ensure subprocesses cleanup before loop closes
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(async_main(mcp_server, mcp_server_url, servers_json, auto_discovery, model, host))
+        loop.run_until_complete(async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, provider, api_key))
     finally:
         try:
             # Ensure executor cleanup completes before closing loop
@@ -1610,47 +2148,90 @@ def main(
         finally:
             loop.close()
 
-async def async_main(mcp_server, mcp_server_url, servers_json, auto_discovery, model, host):
+async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, provider, api_key):
     """Asynchronous main function to run the MCP Client for Ollama"""
 
     console = Console()
 
-    # Create a temporary client to check if Ollama is running
-    initial_host = host if host is not None else DEFAULT_OLLAMA_HOST
-    client = MCPClient(model=model, host=initial_host)
+    # Resolve the provider and its saved connection profile before building the
+    # client, so the preflight check targets the right endpoint on the first try.
+    # `provider`/`model`/`host`/`api_key` are None unless the flag was actually
+    # passed, so CLI values cleanly take precedence over the saved profile
+    # (and `--provider` picks the provider; plain `ollmcp` resumes the last saved).
+    config_mgr = ConfigManager(console)
+    saved = config_mgr.load_configuration("default") if config_mgr.config_exists("default") else {}
+
+    effective_provider = provider or saved.get("defaultProvider") or DEFAULT_PROVIDER
+    if not validate_provider(effective_provider, console):
+        return
+
+    profile = (saved.get("providers") or {}).get(effective_provider) or default_provider_profile(effective_provider)
+
+    # Host: CLI flag > saved profile host > ollama local default / provider default.
+    if host is not None:
+        resolved_host = host
+    elif profile.get("host"):
+        resolved_host = profile["host"]
+    elif effective_provider == "ollama":
+        resolved_host = DEFAULT_OLLAMA_HOST
+    else:
+        resolved_host = None
+
+    # API key precedence: --api-key flag > OLLMCP_API_KEY env var > saved profile.
+    # Keys from the env var are never written back to the config file.
+    env_api_key = os.environ.get("OLLMCP_API_KEY")
+    if api_key:
+        resolved_api_key = api_key
+        persist_api_key = True
+    elif env_api_key:
+        resolved_api_key = env_api_key
+        persist_api_key = False
+    else:
+        resolved_api_key = profile.get("apiKey") or None
+        persist_api_key = True
+    resolved_model = model or profile.get("model") or DEFAULT_MODEL
+
+    try:
+        client = MCPClient(model=resolved_model, host=resolved_host, provider=effective_provider, api_key=resolved_api_key, persist_api_key=persist_api_key)
+    except MissingApiKeyError as e:
+        console.print(Panel(
+            f"[bold red]API key required:[/bold red] The [bold blue]{effective_provider}[/bold blue] provider needs an API key.\n\n"
+            f"Provide one with [bold cyan]--api-key[/bold cyan] / [bold cyan]-k[/bold cyan], "
+            f"or set [bold cyan]$OLLMCP_API_KEY[/bold cyan] or [bold cyan]${e.env_var_name}[/bold cyan].\n\n"
+            "[dim]Tip: if you pass a shell variable, quote it (e.g. [/dim][bold cyan]--api-key \"$MY_KEY\"[/bold cyan][dim]) "
+            "so an unset value isn't silently dropped.[/dim]",
+            title="Missing API Key", border_style="red", expand=False
+        ))
+        return
 
     # Show startup banner before server discovery messages.
     client.print_welcome_ascii()
 
-    if not await preflight_ollama(client, host):
+    if not await preflight_ollama(client):
         return
 
-    # Handle server configuration options - only use one source to prevent duplicates
+    # Registry is always the base layer — merge with any flag-provided sources
     config_path = None
-    auto_discovery_final = auto_discovery
+    merged = registry.merge_scopes()
+    server_configs = merged if merged else None
+    if server_configs:
+        console.print(f"[cyan]Using {len(server_configs)} MCP server(s) from ollmcp registry (local/project/user scopes)[/cyan]")
 
     if servers_json:
-        # If --servers-json is provided, use that and disable auto-discovery
         if os.path.exists(servers_json):
             config_path = servers_json
         else:
             console.print(f"[bold red]Error: Specified JSON config file not found: {servers_json}[/bold red]")
             return
-    elif auto_discovery:
-        # If --auto-discovery is provided, use that and set config_path to None
-        auto_discovery_final = True
+
+    if claude_desktop:
         if os.path.exists(DEFAULT_CLAUDE_CONFIG):
-            console.print(f"[cyan]Auto-discovering servers from Claude's config at {DEFAULT_CLAUDE_CONFIG}[/cyan]")
+            console.print(f"[cyan]Loading servers from Claude Desktop config at {DEFAULT_CLAUDE_CONFIG}[/cyan]")
         else:
-            console.print(f"[yellow]Warning: Claude config not found at {DEFAULT_CLAUDE_CONFIG}[/yellow]")
-    else:
-        # If neither is provided, check if DEFAULT_CLAUDE_CONFIG exists and use auto_discovery
-        if not mcp_server and not mcp_server_url:
-            if os.path.exists(DEFAULT_CLAUDE_CONFIG):
-                console.print(f"[cyan]Auto-discovering servers from Claude's config at {DEFAULT_CLAUDE_CONFIG}[/cyan]")
-                auto_discovery_final = True
-            else:
-                console.print("[yellow]Warning: No servers specified and Claude config not found.[/yellow]")
+            console.print(f"[yellow]Warning: Claude Desktop config not found at {DEFAULT_CLAUDE_CONFIG}[/yellow]")
+
+    if not mcp_server and not mcp_server_url and not server_configs and not config_path and not claude_desktop:
+        console.print("[yellow]No servers configured. Use 'ollmcp mcp add' to register servers, or provide --mcp-server, --mcp-server-url, --servers-json, or --claude-desktop flags.[/yellow]")
 
     # Validate mcp-server paths exist
     if mcp_server:
@@ -1659,17 +2240,17 @@ async def async_main(mcp_server, mcp_server_url, servers_json, auto_discovery, m
                 console.print(f"[bold red]Error: Server script not found: {server_path}[/bold red]")
                 return
     try:
-        await client.connect_to_servers(mcp_server, mcp_server_url, config_path, auto_discovery_final)
+        await client.connect_to_servers(mcp_server, mcp_server_url, config_path, claude_desktop, server_configs)
+        # Connection identity (provider/host/model/apiKey) was already resolved
+        # above; this only applies the shared settings from the saved config.
         client.auto_load_default_config()
 
-        if host != client.host and host is not None:
-            client.host = host
-            client.ollama = ollama.AsyncClient(host=host)
-            client.model_manager.ollama = client.ollama
-
-        # If model was explicitly provided via CLI flag (not default), override any loaded config
-        if model != DEFAULT_MODEL:
-            client.model_manager.set_model(model)
+        # Resolve the model to use: --model flag > saved profile model > first
+        # available model, validated against what's actually installed. The model
+        # resolved before construction is already in model_manager as its current
+        # model, so use it as the saved candidate.
+        saved_model = client.model_manager.get_current_model() if client.default_configuration_status else None
+        client.model_resolution_status = await client.model_manager.resolve_initial_model(model, saved_model)
 
         await client.chat_loop()
     finally:

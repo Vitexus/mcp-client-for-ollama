@@ -13,11 +13,34 @@ if not os.path.exists(DEFAULT_CONFIG_DIR):
 
 DEFAULT_CONFIG_FILE = "config.json"
 
-# Default model
-DEFAULT_MODEL = "qwen2.5:7b"
+# MCP server registry files managed by `ollmcp mcp add/list/remove`
+# User scope: global, available across all projects
+USER_MCP_FILE = os.path.join(DEFAULT_CONFIG_DIR, "mcp.json")
+# Local scope: private per-project, keyed by absolute working directory
+LOCAL_MCP_FILE = os.path.join(DEFAULT_CONFIG_DIR, "mcp.local.json")
+# Project scope: shareable file at the project root (current working directory)
+PROJECT_MCP_FILENAME = ".mcp.json"
+
+# Default model - Just a placeholder now, the actual default is determined by the user's saved configuration or the first available model in Ollama
+DEFAULT_MODEL = "qwen3:0.6b"
 
 # Default ollama lcoal url for API requests
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+# Default LLM provider
+DEFAULT_PROVIDER = "ollama"
+
+# Reasoning effort levels exposed to the user (excludes "none" which conflicts with thinking-mode
+# being the master on/off switch, and any-llm's internal "auto" handling on Ollama is special-cased)
+REASONING_EFFORT_LEVELS = ("auto", "minimal", "low", "medium", "high", "xhigh")
+DEFAULT_REASONING_EFFORT = "medium"
+
+# Providers ollmcp currently supports: Ollama (native) plus OpenAI and any
+# OpenAI-compatible provider (they all use the bundled openai package).
+SUPPORTED_PROVIDERS = (
+    "ollama, openai, and OpenAI-compatible providers "
+    "(openrouter, deepseek, perplexity, etc.)"
+)
 
 # Default number of history entries to display when returning from menus
 DEFAULT_HISTORY_DISPLAY_LIMIT = 5
@@ -63,9 +86,11 @@ INTERACTIVE_COMMANDS = {
     'load-config': 'Load saved configuration',
     'loop-limit': 'Set agent max loop limit',
     'model-config': 'Configure model parameters',
+    'reasoning-effort': 'Set reasoning effort level',
     'model': 'Select Ollama model',
     'input-mode': 'Switch chat input between single-line and multiline',
     'prompts': 'Browse available MCP prompts',
+    'resources': 'Browse available MCP resources',
     'quit': 'Exit the application',
     'reload-servers': 'Reload MCP servers',
     'reset-config': 'Reset to default config',
