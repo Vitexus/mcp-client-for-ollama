@@ -1085,7 +1085,7 @@ qwen3/show-thinking/12-tools❯
 
 ## 服务器配置格式
 
-JSON 配置文件支持 STDIO、SSE 和 Streamable HTTP 服务器类型（MCP 1.10.1）:
+JSON 配置文件支持 STDIO、SSE 和 Streamable HTTP 服务器类型（MCP Python SDK 2.0+）:
 
 ```json
 {
@@ -1119,7 +1119,7 @@ JSON 配置文件支持 STDIO、SSE 和 Streamable HTTP 服务器类型（MCP 1.
 }
 ```
 > [!NOTE]
-> **MCP 1.10.1 传输支持**: 客户端现已支持最新的 Streamable HTTP 传输，性能和可靠性更佳。如果你指定的 URL 没有类型，客户端将默认使用 Streamable HTTP 传输。
+> **MCP Python SDK 2.0**: 客户端现基于 mcp Python SDK 的 v2 系列构建，可针对每个服务器自动协商协议版本（同时支持 2025-11-25 和 2026-07-28 版本）。如果你指定的 URL 没有类型，客户端将默认使用 Streamable HTTP 传输。
 
 ### 小贴士: MCP 服务器配置文件的存放位置及可用示例
 
@@ -1172,10 +1172,10 @@ ollmcp -j ~/.config/ollmcp/mcp-servers/config.json
 
 #### 常见的 MCP 端点路径
 
-Streamable HTTP MCP 服务器通常在 `/mcp` 暴露 MCP 端点（例如 `https://host/mcp`），而 SSE 服务器通常使用 `/sse`（例如 `https://host/sse`）。以下摘自 MCP 规范（2025-06-18）:
+Streamable HTTP MCP 服务器通常在 `/mcp` 暴露 MCP 端点（例如 `https://host/mcp`），而 SSE 服务器通常使用 `/sse`（例如 `https://host/sse`）。以下摘自 MCP 规范:
 > The server MUST provide a single HTTP endpoint path (hereafter referred to as the MCP endpoint) that supports both POST and GET methods. For example, this could be a URL like https://example.com/mcp.
 
-更多详情见 [MCP 规范 2025-06-18 版 - Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)。
+更多详情见 [MCP 规范 - Transports](https://modelcontextprotocol.io/specification/latest/basic/transports)。
 
 ## 兼容的模型
 

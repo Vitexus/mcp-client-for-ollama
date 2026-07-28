@@ -1081,7 +1081,7 @@ The following settings are **shared** across all providers:
 
 ## Server Configuration Format
 
-The JSON configuration file supports STDIO, SSE, and Streamable HTTP server types (MCP 1.10.1):
+The JSON configuration file supports STDIO, SSE, and Streamable HTTP server types (MCP Python SDK 2.0+):
 
 ```json
 {
@@ -1115,7 +1115,7 @@ The JSON configuration file supports STDIO, SSE, and Streamable HTTP server type
 }
 ```
 > [!NOTE]
-> **MCP 1.10.1 Transport Support**: The client now supports the latest Streamable HTTP transport with improved performance and reliability. If you specify a URL without a type, the client will default to using Streamable HTTP transport.
+> **MCP Python SDK 2.0**: The client runs on the mcp Python SDK's v2 line, which negotiates the protocol version automatically per server (supporting both the 2025-11-25 and 2026-07-28 revisions). If you specify a URL without a type, the client will default to using Streamable HTTP transport.
 
 ### Tips: where to put MCP server configs and a working example
 
@@ -1168,10 +1168,10 @@ A short demo (asciicast) that should help anyone reproduce the working setup qui
 
 #### Common MCP endpoint paths
 
-Streamable HTTP MCP servers typically expose the MCP endpoint at `/mcp` (e.g., `https://host/mcp`), while SSE servers commonly use `/sse` (e.g., `https://host/sse`). Below is an excerpt from the MCP specification (2025-06-18):
+Streamable HTTP MCP servers typically expose the MCP endpoint at `/mcp` (e.g., `https://host/mcp`), while SSE servers commonly use `/sse` (e.g., `https://host/sse`). Below is an excerpt from the MCP specification:
 > The server MUST provide a single HTTP endpoint path (hereafter referred to as the MCP endpoint) that supports both POST and GET methods. For example, this could be a URL like https://example.com/mcp.
 
-You can find more details in the [MCP specification version 2025-06-18 - Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
+You can find more details in the [MCP specification - Transports](https://modelcontextprotocol.io/specification/latest/basic/transports).
 
 ## Compatible Models
 
