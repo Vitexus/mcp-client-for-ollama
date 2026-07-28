@@ -9,13 +9,13 @@ import os
 import shutil
 from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional, Tuple
-import httpx
+import httpx2
 from rich.console import Console
 from rich.panel import Panel
-from mcp import ClientSession, Tool
+from mcp import Client, Tool
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
-from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from .discovery import process_server_paths, process_server_urls, parse_server_configs, parse_server_config_mapping, load_claude_desktop_servers
 from ..utils.constants import MCP_PROTOCOL_VERSION
@@ -141,7 +141,7 @@ class ServerConnector:
 
         try:
             server_type = server.get("type", "script")
-            session = None
+            client_obj = None
 
             # Use a local exit stack for this connection attempt.  On failure
             # it exits immediately, closing the transport and clearing any
@@ -149,7 +149,9 @@ class ServerConnector:
             # On success, contexts are transferred to self.exit_stack via pop_all().
             async with AsyncExitStack() as local_stack:
 
-                # Connect based on server type
+                # Connect based on server type. Client(transport) takes the
+                # not-yet-entered transport context manager directly and
+                # performs the connect + MCP handshake itself on __aenter__.
                 if server_type == "sse":
                     # Connect to SSE server
                     url = self._get_url_from_server(server)
@@ -158,11 +160,7 @@ class ServerConnector:
                         return False
 
                     headers = self._get_headers_from_server(server)
-
-                    # Connect using SSE transport
-                    sse_transport = await local_stack.enter_async_context(sse_client(url, headers=headers))
-                    read_stream, write_stream = sse_transport
-                    session = await local_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                    client_obj = await local_stack.enter_async_context(Client(sse_client(url, headers=headers)))
 
                 elif server_type in ("streamable_http", "http"):
                     # Connect to Streamable HTTP server
@@ -173,21 +171,25 @@ class ServerConnector:
 
                     headers = self._get_headers_from_server(server)
 
-                    # Use the streamablehttp_client for Streamable HTTP connections.
-                    # mcp 2.0 dropped the headers= kwarg in favor of an
-                    # http_client carrying them.
-                    http_client = await local_stack.enter_async_context(
-                        httpx.AsyncClient(headers=headers)
-                    )
-                    transport = await local_stack.enter_async_context(
-                        streamablehttp_client(url, http_client=http_client)
-                    )
-                    read_stream, write_stream, session_info = transport
-                    session = await local_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                    # mcp 2.0's streamable_http_client dropped the headers=
+                    # kwarg in favor of an httpx2.AsyncClient carrying them.
+                    # The session ID (if any) is no longer returned directly;
+                    # capture it from the response header via an event hook.
+                    captured_session_ids: List[str] = []
 
-                    # Store session ID if provided
-                    if hasattr(session_info, 'session_id') and session_info.session_id:
-                        self.session_ids[server_name] = session_info.session_id
+                    async def _capture_session_id(response: httpx2.Response) -> None:
+                        sid = response.headers.get("mcp-session-id")
+                        if sid:
+                            captured_session_ids.append(sid)
+
+                    http_client = await local_stack.enter_async_context(
+                        httpx2.AsyncClient(headers=headers, event_hooks={"response": [_capture_session_id]})
+                    )
+                    transport = streamable_http_client(url, http_client=http_client)
+                    client_obj = await local_stack.enter_async_context(Client(transport))
+
+                    if captured_session_ids:
+                        self.session_ids[server_name] = captured_session_ids[-1]
 
                 elif server_type == "script":
                     # Connect to script-based server using STDIO
@@ -195,9 +197,7 @@ class ServerConnector:
                     if server_params is None:
                         return False
 
-                    stdio_transport = await local_stack.enter_async_context(stdio_client(server_params))
-                    read_stream, write_stream = stdio_transport
-                    session = await local_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                    client_obj = await local_stack.enter_async_context(Client(stdio_client(server_params)))
 
                 else:
                     # Connect to config-based server using STDIO
@@ -205,12 +205,9 @@ class ServerConnector:
                     if server_params is None:
                         return False
 
-                    stdio_transport = await local_stack.enter_async_context(stdio_client(server_params))
-                    read_stream, write_stream = stdio_transport
-                    session = await local_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                    client_obj = await local_stack.enter_async_context(Client(stdio_client(server_params)))
 
-                # Initialize the session and capture capabilities
-                init_result = await session.initialize()
+                # Entering Client(...) above already performed the MCP handshake.
                 initialized = True
 
                 # Success — transfer connection contexts to the main exit_stack.
@@ -219,16 +216,16 @@ class ServerConnector:
 
             # Store the session
             self.sessions[server_name] = {
-                "session": session,
+                "session": client_obj,
                 "tools": []
             }
 
             # Get tools from this server if capability is present
             server_tools = []
-            capabilities = getattr(init_result, 'capabilities', None)
-            if capabilities and getattr(capabilities, 'tools', None):
+            capabilities = client_obj.server_capabilities
+            if getattr(capabilities, 'tools', None):
                 try:
-                    response = await session.list_tools()
+                    response = await client_obj.list_tools()
                     # Store and merge tools, prepending server name to avoid conflicts
                     for tool in response.tools:
                         # Create a qualified name for the tool that includes the server
@@ -237,7 +234,7 @@ class ServerConnector:
                         tool_copy = Tool(
                             name=qualified_name,
                             description=f"[{server_name}] {tool.description}" if hasattr(tool, 'description') else f"Tool from {server_name}",
-                            inputSchema=tool.inputSchema,
+                            input_schema=tool.input_schema,
                         )
                         server_tools.append(tool_copy)
                         self.enabled_tools[qualified_name] = True
@@ -253,9 +250,9 @@ class ServerConnector:
 
             # Get prompts from this server if capability is present
             server_prompts = []
-            if capabilities and getattr(capabilities, 'prompts', None):
+            if getattr(capabilities, 'prompts', None):
                 try:
-                    prompts_response = await session.list_prompts()
+                    prompts_response = await client_obj.list_prompts()
                     server_prompts = prompts_response.prompts if hasattr(prompts_response, 'prompts') else []
                     if server_prompts:
                         self.prompts_by_server[server_name] = server_prompts
@@ -269,9 +266,9 @@ class ServerConnector:
             # Get resources (static list + templates) if capability is present
             server_resources = []
             server_templates = []
-            if capabilities and getattr(capabilities, 'resources', None):
+            if getattr(capabilities, 'resources', None):
                 try:
-                    resources_response = await session.list_resources()
+                    resources_response = await client_obj.list_resources()
                     server_resources = resources_response.resources if hasattr(resources_response, 'resources') else []
                     if server_resources:
                         self.resources_by_server[server_name] = server_resources
@@ -280,8 +277,8 @@ class ServerConnector:
                 except Exception as e:
                     self.console.print(f"[yellow]Warning: Failed to list resources from {server_name}: {str(e)}[/yellow]")
                 try:
-                    templates_response = await session.list_resource_templates()
-                    server_templates = templates_response.resourceTemplates if hasattr(templates_response, 'resourceTemplates') else []
+                    templates_response = await client_obj.list_resource_templates()
+                    server_templates = templates_response.resource_templates if hasattr(templates_response, 'resource_templates') else []
                     if server_templates:
                         self.templates_by_server[server_name] = server_templates
                 except asyncio.CancelledError:

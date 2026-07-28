@@ -29,7 +29,7 @@ class TestResourceManager(unittest.TestCase):
         mock_resource.uri = "file:///test.txt"
         mock_resource.name = "test.txt"
         mock_resource.description = "Test file"
-        mock_resource.mimeType = "text/plain"
+        mock_resource.mime_type = "text/plain"
 
         self.manager.set_resources({"test-server": [mock_resource]})
 
@@ -38,10 +38,10 @@ class TestResourceManager(unittest.TestCase):
 
     def test_set_templates(self):
         mock_template = MagicMock()
-        mock_template.uriTemplate = "file:///{path}"
+        mock_template.uri_template = "file:///{path}"
         mock_template.name = "Project Files"
         mock_template.description = "Access project files"
-        mock_template.mimeType = None
+        mock_template.mime_type = None
 
         self.manager.set_templates({"test-server": [mock_template]})
 
@@ -73,7 +73,7 @@ class TestResourceManager(unittest.TestCase):
             r.uri = f"file:///test{i}.txt"
             r.name = f"test{i}.txt"
             r.description = f"Test file {i}"
-            r.mimeType = "text/plain"
+            r.mime_type = "text/plain"
             self.manager.set_resources({srv: [r]} if i == 1 else {**self.manager.resources_by_server, srv: [r]})
 
         resources = self.manager.list_all()
@@ -84,7 +84,7 @@ class TestResourceManager(unittest.TestCase):
         mock_resource.uri = "file:///test.txt"
         mock_resource.name = "test.txt"
         mock_resource.description = "Test file"
-        mock_resource.mimeType = "text/plain"
+        mock_resource.mime_type = "text/plain"
 
         self.manager.set_resources({"test-server": [mock_resource]})
 
@@ -99,7 +99,7 @@ class TestResourceManager(unittest.TestCase):
         mock_resource.name = "test.txt"
 
         mock_template = MagicMock()
-        mock_template.uriTemplate = "file:///{path}"
+        mock_template.uri_template = "file:///{path}"
         mock_template.name = "Project Files"
 
         self.manager.set_resources({"server1": [mock_resource]})
@@ -130,12 +130,12 @@ class TestResourceManagerMultiContent(unittest.IsolatedAsyncioTestCase):
         handler = ResourceHandler(console, manager, MagicMock())
 
         # Build a read_result with two text content blocks
-        block1 = MagicMock(spec=['text', 'mimeType'])
+        block1 = MagicMock(spec=['text', 'mime_type'])
         block1.text = "Hello"
-        block1.mimeType = 'text/plain'
-        block2 = MagicMock(spec=['text', 'mimeType'])
+        block1.mime_type = 'text/plain'
+        block2 = MagicMock(spec=['text', 'mime_type'])
         block2.text = "World"
-        block2.mimeType = 'text/plain'
+        block2.mime_type = 'text/plain'
 
         mock_read_result = MagicMock()
         mock_read_result.contents = [block1, block2]
@@ -164,9 +164,9 @@ class TestResourceManagerMultiContent(unittest.IsolatedAsyncioTestCase):
 
         handler = ResourceHandler(console, manager, MagicMock())
 
-        blob_block = MagicMock(spec=['blob', 'mimeType'])
+        blob_block = MagicMock(spec=['blob', 'mime_type'])
         blob_block.blob = b"%PDF-binary-data"
-        blob_block.mimeType = 'application/pdf'  # non-image binary
+        blob_block.mime_type = 'application/pdf'  # non-image binary
 
         mock_read_result = MagicMock()
         mock_read_result.contents = [blob_block]
@@ -194,9 +194,9 @@ class TestResourceManagerMultiContent(unittest.IsolatedAsyncioTestCase):
         handler = ResourceHandler(console, manager, MagicMock())
 
         raw_bytes = b"\x89PNG\r\nfakedata"
-        blob_block = MagicMock(spec=['blob', 'mimeType'])
+        blob_block = MagicMock(spec=['blob', 'mime_type'])
         blob_block.blob = raw_bytes
-        blob_block.mimeType = 'image/png'
+        blob_block.mime_type = 'image/png'
 
         mock_read_result = MagicMock()
         mock_read_result.contents = [blob_block]
@@ -228,9 +228,9 @@ class TestResourceManagerMultiContent(unittest.IsolatedAsyncioTestCase):
         handler = ResourceHandler(console, manager, MagicMock())
 
         b64_string = base64.b64encode(b"fakepng").decode('ascii')
-        blob_block = MagicMock(spec=['blob', 'mimeType'])
+        blob_block = MagicMock(spec=['blob', 'mime_type'])
         blob_block.blob = b64_string  # already a string
-        blob_block.mimeType = 'image/png'
+        blob_block.mime_type = 'image/png'
 
         mock_read_result = MagicMock()
         mock_read_result.contents = [blob_block]
@@ -255,36 +255,35 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
 
             server = {"name": "test-server", "type": "script", "path": "/tmp/test_server.py"}
 
-            mock_session = AsyncMock()
-            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = False
-            mock_init_result = MagicMock()
-            mock_init_result.capabilities = MagicMock()
-            mock_init_result.capabilities.tools = None
-            mock_init_result.capabilities.prompts = None
-            mock_init_result.capabilities.resources = MagicMock()
+            mock_client = AsyncMock()
+            mock_client.server_capabilities = MagicMock()
+            mock_client.server_capabilities.tools = None
+            mock_client.server_capabilities.prompts = None
+            mock_client.server_capabilities.resources = MagicMock()
 
             mock_resource = MagicMock()
             mock_resource.uri = "file:///test.txt"
             mock_resource.name = "test.txt"
 
             mock_template = MagicMock()
-            mock_template.uriTemplate = "file:///{path}"
+            mock_template.uri_template = "file:///{path}"
             mock_template.name = "Project Files"
 
             mock_resources_response = MagicMock()
             mock_resources_response.resources = [mock_resource]
 
             mock_templates_response = MagicMock()
-            mock_templates_response.resourceTemplates = [mock_template]
+            mock_templates_response.resource_templates = [mock_template]
 
-            mock_session.initialize.return_value = mock_init_result
-            mock_session.list_resources.return_value = mock_resources_response
-            mock_session.list_resource_templates.return_value = mock_templates_response
+            mock_client.list_resources.return_value = mock_resources_response
+            mock_client.list_resource_templates.return_value = mock_templates_response
+
+            mock_cm = AsyncMock()
+            mock_cm.__aenter__.return_value = mock_client
+            mock_cm.__aexit__.return_value = False
 
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
+                 patch('mcp_client_for_ollama.server.connector.Client', return_value=mock_cm), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
                 mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -296,9 +295,9 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
                 assert "test-server" in connector.resources_by_server
                 assert connector.resources_by_server["test-server"][0].uri == "file:///test.txt"
                 assert "test-server" in connector.templates_by_server
-                assert connector.templates_by_server["test-server"][0].uriTemplate == "file:///{path}"
-                mock_session.list_resources.assert_called_once()
-                mock_session.list_resource_templates.assert_called_once()
+                assert connector.templates_by_server["test-server"][0].uri_template == "file:///{path}"
+                mock_client.list_resources.assert_called_once()
+                mock_client.list_resource_templates.assert_called_once()
 
     async def test_server_without_resources_capability(self):
         """No resources or templates fetched when server lacks the capability."""
@@ -307,20 +306,18 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
 
             server = {"name": "test-server", "type": "script", "path": "/tmp/test_server.py"}
 
-            mock_session = AsyncMock()
-            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
-            mock_session.__aenter__.return_value = mock_session
-            mock_session.__aexit__.return_value = False
-            mock_init_result = MagicMock()
-            mock_init_result.capabilities = MagicMock()
-            mock_init_result.capabilities.tools = None
-            mock_init_result.capabilities.prompts = None
-            mock_init_result.capabilities.resources = None
+            mock_client = AsyncMock()
+            mock_client.server_capabilities = MagicMock()
+            mock_client.server_capabilities.tools = None
+            mock_client.server_capabilities.prompts = None
+            mock_client.server_capabilities.resources = None
 
-            mock_session.initialize.return_value = mock_init_result
+            mock_cm = AsyncMock()
+            mock_cm.__aenter__.return_value = mock_client
+            mock_cm.__aexit__.return_value = False
 
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
+                 patch('mcp_client_for_ollama.server.connector.Client', return_value=mock_cm), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
                 mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -331,8 +328,8 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
                 assert result is True
                 assert "test-server" not in connector.resources_by_server
                 assert "test-server" not in connector.templates_by_server
-                mock_session.list_resources.assert_not_called()
-                mock_session.list_resource_templates.assert_not_called()
+                mock_client.list_resources.assert_not_called()
+                mock_client.list_resource_templates.assert_not_called()
 
 
 if __name__ == '__main__':
