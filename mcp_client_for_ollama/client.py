@@ -553,7 +553,7 @@ class MCPClient:
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema
+                "parameters": tool.inputSchema
             }
         } for tool in enabled_tool_objects]
 
@@ -606,7 +606,7 @@ class MCPClient:
 
         enabled_tools = self.tool_manager.get_enabled_tool_objects()
         tool_schema_map = {
-            tool.name: (tool.input_schema or {"type": "object"})
+            tool.name: (tool.inputSchema or {"type": "object"})
             for tool in enabled_tool_objects
         }
 

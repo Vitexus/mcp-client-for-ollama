@@ -9,6 +9,7 @@ import os
 import shutil
 from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional, Tuple
+import httpx
 from rich.console import Console
 from rich.panel import Panel
 from mcp import ClientSession, Tool
@@ -172,9 +173,14 @@ class ServerConnector:
 
                     headers = self._get_headers_from_server(server)
 
-                    # Use the streamablehttp_client for Streamable HTTP connections
+                    # Use the streamablehttp_client for Streamable HTTP connections.
+                    # mcp 2.0 dropped the headers= kwarg in favor of an
+                    # http_client carrying them.
+                    http_client = await local_stack.enter_async_context(
+                        httpx.AsyncClient(headers=headers)
+                    )
                     transport = await local_stack.enter_async_context(
-                        streamablehttp_client(url, headers=headers)
+                        streamablehttp_client(url, http_client=http_client)
                     )
                     read_stream, write_stream, session_info = transport
                     session = await local_stack.enter_async_context(ClientSession(read_stream, write_stream))
@@ -231,7 +237,7 @@ class ServerConnector:
                         tool_copy = Tool(
                             name=qualified_name,
                             description=f"[{server_name}] {tool.description}" if hasattr(tool, 'description') else f"Tool from {server_name}",
-                            input_schema=tool.input_schema,
+                            inputSchema=tool.inputSchema,
                         )
                         server_tools.append(tool_copy)
                         self.enabled_tools[qualified_name] = True
