@@ -38,7 +38,7 @@ DEFAULT_REASONING_EFFORT = "medium"
 # Providers ollmcp currently supports: Ollama (native) plus OpenAI and any
 # OpenAI-compatible provider (they all use the bundled openai package).
 SUPPORTED_PROVIDERS = (
-    "ollama, openai, and OpenAI-compatible providers "
+    "ollama, openai, atlascloud, and OpenAI-compatible providers "
     "(openrouter, deepseek, perplexity, etc.)"
 )
 
@@ -95,7 +95,7 @@ INTERACTIVE_COMMANDS = {
     'reload-servers': 'Reload MCP servers',
     'reset-config': 'Reset to default config',
     'save-config': 'Save current configuration',
-    'display-mode': 'Choose plain, markdown, or both display modes',
+    'display-mode': 'Choose plain, markdown, both, or blocks display modes',
     'show-metrics': 'Toggle performance metrics display',
     'show-thinking': 'Toggle thinking visibility',
     'show-tool-execution': 'Toggle tool execution display',

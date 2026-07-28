@@ -6,6 +6,22 @@ approve, or skip tool executions before they are performed.
 
 from rich.prompt import Prompt
 from rich.console import Console
+from rich.markup import escape
+
+from .sanitize import strip_control_chars
+
+
+def _sanitize_for_display(value) -> str:
+    """Make an arbitrary tool-argument value safe to print in the prompt.
+
+    Tool arguments come from the model and may echo content supplied by a
+    malicious MCP server. When we show them for approval, two things must not
+    happen: control characters must not corrupt or spoof the terminal, and Rich
+    markup must not be interpreted. So we strip control characters (keeping tab
+    and newline) and escape Rich markup. The value is otherwise shown in full,
+    never truncated, so nothing is hidden at the moment the user approves.
+    """
+    return escape(strip_control_chars(str(value)))
 
 
 class AbortQueryException(Exception):
@@ -97,11 +113,20 @@ class HumanInTheLoopManager:
         if tool_args:
             self.console.print("[cyan]Arguments:[/cyan]")
             for key, value in tool_args.items():
-                # Truncate long values for display
-                display_value = str(value)
-                if len(display_value) > 50:
-                    display_value = display_value[:47] + "..."
-                self.console.print(f"  • {key}: {display_value}")
+                # Show the full value so nothing is hidden from the user during
+                # confirmation. Truncating here could conceal part of a payload
+                # (e.g. an injected command or key) that the user needs to see
+                # before approving. _sanitize_for_display strips control
+                # characters and escapes Rich markup so a malicious value can't
+                # spoof the terminal or hide part of its content.
+                safe_key = _sanitize_for_display(key)
+                display_value = _sanitize_for_display(value)
+                if "\n" in display_value:
+                    # Indent multi-line values so they stay visually grouped
+                    indented = display_value.replace("\n", "\n      ")
+                    self.console.print(f"  • [bold]{safe_key}[/bold]:\n      {indented}")
+                else:
+                    self.console.print(f"  • [bold]{safe_key}[/bold]: {display_value}")
         else:
             self.console.print("[cyan]Arguments:[/cyan] [dim]None[/dim]")
 
