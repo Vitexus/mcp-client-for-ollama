@@ -325,6 +325,28 @@ ollmcp mcp add --env API_KEY=YOUR_KEY --transport sse my-sse-server http://local
 - `--install-completion`: 为客户端安装 shell 自动补全脚本
 - `--show-completion`: 显示可用的 shell 补全选项
 
+#### MCP 服务器日志:
+
+MCP 服务器报告的所有内容都会写入 `~/.config/ollmcp/logs/<session>/<server>.log`，每次运行一个目录，保留最近 5 次。**除非你主动要求，服务器打印的内容都不会显示在屏幕上** —— 否则它会覆盖正在流式输出的回答。
+
+服务器通过两个渠道报告：**stderr**（仅限 stdio 服务器，因为远程服务器运行在别处）和 **MCP 日志通知**（任何服务器）。**这两个选项只改变屏幕上显示的内容 —— 日志文件无论如何都会收到全部内容：**
+
+| | 写入日志文件 | 显示在屏幕上 |
+|---|---|---|
+| *(不加选项)* | 服务器发送的全部内容 | 服务器的内容都不显示 |
+| `--debug` | 服务器发送的全部内容 | 全部内容，实时显示 |
+| `--log-level LEVEL` | 服务器发送的全部内容 | 仅该级别及以上的通知 |
+| `--debug --log-level LEVEL` | 服务器发送的全部内容 | 完整的 stderr + 该级别及以上的通知 |
+
+LEVEL 为 `debug`、`info`、`notice`、`warning`、`error`、`critical`、`alert`、`emergency` 之一。
+
+不加选项时不会请求任何级别：由服务器决定发送什么，并全部记录下来。`--log-level` 用于过滤你看到的内容；当服务器声明了 logging capability 时，该级别还会通过 `logging/setLevel` 发送给服务器 —— 此时服务器可能不再发送更低的级别，那些内容也就不会出现在文件里。没有该 capability 的服务器会照常发送全部内容，过滤在客户端进行。
+
+当服务器连接失败时，错误信息会指向它的日志文件：服务器退出前打印的内容都在里面，那通常才是真正的原因。
+
+> [!NOTE]
+> ollmcp 自身报告的内容写入 `~/.config/ollmcp/logs/<session>/ollmcp.log`，与服务器的日志文件放在同一目录。它每次运行都会写入，不需要 `--debug`；屏幕上提示响应流提前结束时，指向的就是这个文件。目前仍在完善中（work in progress）：现在主要记录提供商和流式输出的错误，以后会记录更多内容。
+
 ### 支持的推理提供商
 
 > [!WARNING]
@@ -528,7 +550,7 @@ ollmcp -s /path/to/weather.py -u http://localhost:8000/mcp --claude-desktop
 | 命令             | 快捷方式         | 说明                                                |
 |------------------|------------------|-----------------------------------------------------|
 | `abort`          | `a`              | 模型生成期间，中止当前响应的生成                    |
-| `/clear`         | `/cc`            | 清除对话历史和上下文                                |
+| `/clear`, `/new` | `/cc`            | 清除对话历史和上下文                                |
 | `/cls`           | `/clear-screen`  | 清空终端屏幕                                        |
 | `/context`       | `/c`             | 切换上下文保留                                      |
 | `/context-info`  | `/ci`            | 显示上下文统计信息                                  |
@@ -1085,7 +1107,7 @@ qwen3/show-thinking/12-tools❯
 
 ## 服务器配置格式
 
-JSON 配置文件支持 STDIO、SSE 和 Streamable HTTP 服务器类型（MCP Python SDK 2.0+）:
+JSON 配置文件支持 STDIO、SSE 和 Streamable HTTP 服务器类型（MCP 1.10.1）:
 
 ```json
 {
@@ -1119,7 +1141,7 @@ JSON 配置文件支持 STDIO、SSE 和 Streamable HTTP 服务器类型（MCP Py
 }
 ```
 > [!NOTE]
-> **MCP Python SDK 2.0**: 客户端现基于 mcp Python SDK 的 v2 系列构建，可针对每个服务器自动协商协议版本（同时支持 2025-11-25 和 2026-07-28 版本）。如果你指定的 URL 没有类型，客户端将默认使用 Streamable HTTP 传输。
+> **MCP 1.10.1 传输支持**: 客户端现已支持最新的 Streamable HTTP 传输，性能和可靠性更佳。如果你指定的 URL 没有类型，客户端将默认使用 Streamable HTTP 传输。
 
 ### 小贴士: MCP 服务器配置文件的存放位置及可用示例
 
@@ -1172,10 +1194,17 @@ ollmcp -j ~/.config/ollmcp/mcp-servers/config.json
 
 #### 常见的 MCP 端点路径
 
-Streamable HTTP MCP 服务器通常在 `/mcp` 暴露 MCP 端点（例如 `https://host/mcp`），而 SSE 服务器通常使用 `/sse`（例如 `https://host/sse`）。以下摘自 MCP 规范:
+Streamable HTTP MCP 服务器通常在 `/mcp` 暴露 MCP 端点（例如 `https://host/mcp`），而 SSE 服务器通常使用 `/sse`（例如 `https://host/sse`）。以下摘自 MCP 规范（2025-06-18）:
 > The server MUST provide a single HTTP endpoint path (hereafter referred to as the MCP endpoint) that supports both POST and GET methods. For example, this could be a URL like https://example.com/mcp.
 
-更多详情见 [MCP 规范 - Transports](https://modelcontextprotocol.io/specification/latest/basic/transports)。
+更多详情见 [MCP 规范 2025-06-18 版 - Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)。
+
+> [!NOTE]
+> 远程 MCP 服务器的 HTTPS 证书是根据**操作系统信任库**验证的，而不是 `certifi` 证书包。如果 MCP 服务器位于私有或企业 CA 之后，或者你在没有系统 CA 库的精简容器中运行 ollmcp，TLS 握手会失败，且错误信息不会提及 ollmcp。将 `SSL_CERT_FILE`（证书包文件）或 `SSL_CERT_DIR`（目录）指向你的 CA 即可解决:
+>
+> ```bash
+> export SSL_CERT_FILE=/path/to/corporate-ca.pem
+> ```
 
 ## 兼容的模型
 

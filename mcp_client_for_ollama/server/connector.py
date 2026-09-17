@@ -7,18 +7,29 @@ initialization, and communication.
 import asyncio
 import os
 import shutil
+import warnings
 from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional, Tuple
-import httpx2
 from rich.console import Console
 from rich.panel import Panel
-from mcp import Client, Tool
+import httpx2
+from mcp import ClientSession, MCPDeprecationWarning, Tool
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 
-from .discovery import process_server_paths, process_server_urls, parse_server_configs, parse_server_config_mapping, load_claude_desktop_servers
-from ..utils.constants import MCP_PROTOCOL_VERSION
+from .discovery import process_server_paths, process_server_urls, parse_server_configs, parse_server_config_mapping, load_claude_desktop_servers, deduplicate_servers
+from ..utils.constants import MCP_LOG_LEVELS, MCP_PROTOCOL_VERSION
+from ..utils.server_logs import ServerLogSink
+
+# The request each capability is listed with, named the way it goes over the
+# wire so a server-side log can be matched against the warning.
+CAPABILITY_LISTINGS = {
+    "tools": "tools/list",
+    "prompts": "prompts/list",
+    "resources": "resources/list",
+    "resource_templates": "resources/templates/list",
+}
 
 class ServerConnector:
     """Manages connections to one or more MCP servers.
@@ -28,19 +39,24 @@ class ServerConnector:
     tools provided by those servers.
     """
 
-    def __init__(self, exit_stack: AsyncExitStack, console: Optional[Console] = None):
+    def __init__(self, exit_stack: AsyncExitStack, console: Optional[Console] = None, debug: bool = False, log_level: Optional[str] = None):
         """Initialize the ServerConnector.
 
         Args:
             exit_stack: AsyncExitStack to manage server connections
             console: Rich console for output (optional)
+            debug: Show everything the servers report, including the stderr of
+                stdio servers
+            log_level: Lowest level of MCP log notification to show. Wins over
+                debug, which only picks the level when none was asked for.
         """
         self.exit_stack = exit_stack
         self.console = console or Console()
+        self.debug = debug
+        self.log_level = log_level or ("debug" if debug else None)
         self.sessions = {}  # Dict to store multiple sessions
         self.available_tools = []  # List to store all available tools
         self.enabled_tools = {}  # Dict to store tool enabled status
-        self.session_ids = {}  # Dict to store session IDs for HTTP connections
         self.prompts_by_server = {}  # Dict to store prompts grouped by server
         self.resources_by_server = {}  # Dict to store resources grouped by server
         self.templates_by_server = {}  # Dict to store resource templates grouped by server
@@ -101,6 +117,13 @@ class ServerConnector:
                 self.console.print(f"[cyan]Found Claude Desktop server: {server['name']}[/cyan]")
             all_servers.extend(desktop_servers)
 
+        # The sources above are independent, so the same endpoint can arrive
+        # twice and distinct endpoints can arrive with the same name. Resolve
+        # both before connecting, or the second connection overwrites the first.
+        all_servers, notices = deduplicate_servers(all_servers)
+        for notice in notices:
+            self.console.print(f"[yellow]{notice}[/yellow]")
+
         if not all_servers:
             self.console.print(Panel(
                 "[yellow]No servers specified or all servers were invalid.[/yellow]\n"
@@ -125,11 +148,39 @@ class ServerConnector:
     async def _connect_to_server(self, server: Dict[str, Any]) -> bool:
         """Connect to a single MCP server
 
+        A server can advertise a capability and then kill the transport when it
+        is actually queried (issue #274). Losing the whole server over that
+        would cost the user the tools that do work, so the attempt is repeated
+        without the listing that dropped the connection.
+
         Args:
             server: Server configuration dictionary
 
         Returns:
             bool: True if connection was successful, False otherwise
+        """
+        skipped: set[str] = set()
+        while True:
+            connected, dropped = await self._attempt_connection(server, skipped)
+            if dropped is None or dropped in skipped:
+                return connected
+            skipped.add(dropped)
+            self.console.print(
+                f"[yellow]Warning: {server['name']} closed the connection on "
+                f"{CAPABILITY_LISTINGS[dropped]}; reconnecting without it[/yellow]"
+            )
+
+    async def _attempt_connection(self, server: Dict[str, Any], skipped: set[str]) -> Tuple[bool, Optional[str]]:
+        """Make one connection attempt to a single MCP server
+
+        Args:
+            server: Server configuration dictionary
+            skipped: Capabilities whose listing killed the transport on an
+                earlier attempt, and must not be queried again
+
+        Returns:
+            Tuple of (connected, dropped), where dropped names the capability
+            whose listing closed the connection, or None
         """
         server_name = server["name"]
         self.console.print(f"[cyan]Connecting to server: {server_name}[/cyan]")
@@ -138,172 +189,130 @@ class ServerConnector:
         # later (while querying capabilities) is not reported as the server
         # failing to answer initialize.
         initialized = False
+        # The server's log file, pointed at if the connection fails
+        log_path = None
 
+        dropped = None
         try:
             server_type = server.get("type", "script")
-            client_obj = None
+            session = None
 
             # Use a local exit stack for this connection attempt.  On failure
             # it exits immediately, closing the transport and clearing any
             # cancelled anyio scope so it cannot leak into later operations.
-            # On success, contexts are transferred to self.exit_stack via pop_all().
+            # It owns the connection until the capabilities have been listed;
+            # only a fully answered handshake is transferred to self.exit_stack
+            # via pop_all().
             async with AsyncExitStack() as local_stack:
 
-                # Connect based on server type. Client(transport) takes the
-                # not-yet-entered transport context manager directly and
-                # performs the connect + MCP handshake itself on __aenter__.
+                # Everything the server reports goes to its own log file: the
+                # stderr of a stdio server would otherwise print over whatever
+                # is on screen, including a streaming answer (issue #293).
+                # Registered before the transport so it closes after it: the
+                # pipe reaches EOF only once the server process is gone.
+                # Only a stdio server has a stderr to intercept; a remote one
+                # reports through log notifications, which the sink echoes on
+                # their own path.
+                is_stdio = server_type not in ("sse", "streamable_http")
+                log_sink = ServerLogSink(server_name, console=self.console, echo_stderr=self.debug and is_stdio)
+                log_path = log_sink.path
+                local_stack.callback(log_sink.close)
+                logging_callback = self._make_logging_callback(log_sink)
+
+                # Connect based on server type
                 if server_type == "sse":
                     # Connect to SSE server
                     url = self._get_url_from_server(server)
                     if not url:
                         self.console.print(f"[red]Error: SSE server {server_name} missing URL[/red]")
-                        return False
+                        return False, None
 
                     headers = self._get_headers_from_server(server)
-                    client_obj = await local_stack.enter_async_context(Client(sse_client(url, headers=headers)))
 
-                elif server_type in ("streamable_http", "http"):
+                    # Connect using SSE transport
+                    sse_transport = await local_stack.enter_async_context(sse_client(url, headers=headers))
+                    read_stream, write_stream = sse_transport
+                    session = await local_stack.enter_async_context(
+                        ClientSession(read_stream, write_stream, logging_callback=logging_callback)
+                    )
+
+                elif server_type == "streamable_http":
                     # Connect to Streamable HTTP server
                     url = self._get_url_from_server(server)
                     if not url:
                         self.console.print(f"[red]Error: HTTP server {server_name} missing URL[/red]")
-                        return False
+                        return False, None
 
                     headers = self._get_headers_from_server(server)
 
-                    # mcp 2.0's streamable_http_client dropped the headers=
-                    # kwarg in favor of an httpx2.AsyncClient carrying them.
-                    # The session ID (if any) is no longer returned directly;
-                    # capture it from the response header via an event hook.
-                    captured_session_ids: List[str] = []
-
-                    async def _capture_session_id(response: httpx2.Response) -> None:
-                        sid = response.headers.get("mcp-session-id")
-                        if sid:
-                            captured_session_ids.append(sid)
-
+                    # streamable_http_client takes no transport-level options: headers,
+                    # timeouts and redirects are configured on the httpx2 client instead.
+                    # The values mirror the ones the SDK applies to a client of its own.
                     http_client = await local_stack.enter_async_context(
-                        httpx2.AsyncClient(headers=headers, event_hooks={"response": [_capture_session_id]})
+                        httpx2.AsyncClient(
+                            headers=headers,
+                            timeout=httpx2.Timeout(30, read=300),
+                            follow_redirects=True,
+                        )
                     )
-                    transport = streamable_http_client(url, http_client=http_client)
-                    client_obj = await local_stack.enter_async_context(Client(transport))
-
-                    if captured_session_ids:
-                        self.session_ids[server_name] = captured_session_ids[-1]
-
-                elif server_type == "script":
-                    # Connect to script-based server using STDIO
-                    server_params = self._create_script_params(server)
-                    if server_params is None:
-                        return False
-
-                    client_obj = await local_stack.enter_async_context(Client(stdio_client(server_params)))
+                    transport = await local_stack.enter_async_context(
+                        streamable_http_client(url, http_client=http_client)
+                    )
+                    read_stream, write_stream = transport
+                    session = await local_stack.enter_async_context(
+                        ClientSession(read_stream, write_stream, logging_callback=logging_callback)
+                    )
 
                 else:
-                    # Connect to config-based server using STDIO
-                    server_params = self._create_config_params(server)
+                    # Connect to a STDIO server, given either as a script path
+                    # or as a full command
+                    if server_type == "script":
+                        server_params = self._create_script_params(server)
+                    else:
+                        server_params = self._create_config_params(server)
                     if server_params is None:
-                        return False
+                        return False, None
 
-                    client_obj = await local_stack.enter_async_context(Client(stdio_client(server_params)))
+                    stdio_transport = await local_stack.enter_async_context(
+                        stdio_client(server_params, errlog=log_sink.stream)
+                    )
+                    read_stream, write_stream = stdio_transport
+                    session = await local_stack.enter_async_context(
+                        ClientSession(read_stream, write_stream, logging_callback=logging_callback)
+                    )
 
-                # Entering Client(...) above already performed the MCP handshake.
+                # Initialize the session and capture capabilities
+                init_result = await session.initialize()
                 initialized = True
 
-                # Success — transfer connection contexts to the main exit_stack.
-                # local_stack is now empty; its __aexit__ becomes a no-op.
-                await self.exit_stack.enter_async_context(local_stack.pop_all())
+                # Capabilities are listed while local_stack still owns the
+                # connection: a server that dies when one of them is queried
+                # (issue #274) would otherwise leave its cancelled anyio scope
+                # in the shared exit stack, from where it cancels the client
+                # itself at the next await, long after this call returned.
+                dropped = await self._list_capabilities(session, server_name, init_result, skipped)
 
-            # Store the session
-            self.sessions[server_name] = {
-                "session": client_obj,
-                "tools": []
-            }
+                if dropped is None:
+                    # Success — transfer connection contexts to the main exit_stack.
+                    # local_stack is now empty; its __aexit__ becomes a no-op.
+                    await self.exit_stack.enter_async_context(local_stack.pop_all())
 
-            # Get tools from this server if capability is present
-            server_tools = []
-            capabilities = client_obj.server_capabilities
-            if getattr(capabilities, 'tools', None):
-                try:
-                    response = await client_obj.list_tools()
-                    # Store and merge tools, prepending server name to avoid conflicts
-                    for tool in response.tools:
-                        # Create a qualified name for the tool that includes the server
-                        qualified_name = f"{server_name}.{tool.name}"
-                        # Clone the tool but update the name
-                        tool_copy = Tool(
-                            name=qualified_name,
-                            description=f"[{server_name}] {tool.description}" if hasattr(tool, 'description') else f"Tool from {server_name}",
-                            input_schema=tool.input_schema,
-                        )
-                        server_tools.append(tool_copy)
-                        self.enabled_tools[qualified_name] = True
-                except asyncio.CancelledError:
-                    self.console.print(f"[yellow]Warning: Listing tools from {server_name} was cancelled; continuing without them[/yellow]")
-                except Exception as e:
-                    self.console.print(f"[yellow]Warning: Failed to list tools from {server_name}: {str(e)}[/yellow]")
-            else:
-                self.console.print(f"[dim]Server {server_name} does not support tools capability[/dim]")
+            if dropped is not None:
+                # local_stack has just unwound the dead transport. Unwinding it
+                # usually raises on its way out and lands in the handlers below,
+                # but a clean one ends up here.
+                self._discard_server_state(server_name)
+                return False, dropped
 
-            self.sessions[server_name]["tools"] = server_tools
-            self.available_tools.extend(server_tools)
-
-            # Get prompts from this server if capability is present
-            server_prompts = []
-            if getattr(capabilities, 'prompts', None):
-                try:
-                    prompts_response = await client_obj.list_prompts()
-                    server_prompts = prompts_response.prompts if hasattr(prompts_response, 'prompts') else []
-                    if server_prompts:
-                        self.prompts_by_server[server_name] = server_prompts
-                except asyncio.CancelledError:
-                    self.console.print(f"[yellow]Warning: Listing prompts from {server_name} was cancelled; continuing without them[/yellow]")
-                except Exception as e:
-                    self.console.print(f"[yellow]Warning: Failed to list prompts from {server_name}: {str(e)}[/yellow]")
-            else:
-                self.console.print(f"[dim]Server {server_name} does not support prompts capability[/dim]")
-
-            # Get resources (static list + templates) if capability is present
-            server_resources = []
-            server_templates = []
-            if getattr(capabilities, 'resources', None):
-                try:
-                    resources_response = await client_obj.list_resources()
-                    server_resources = resources_response.resources if hasattr(resources_response, 'resources') else []
-                    if server_resources:
-                        self.resources_by_server[server_name] = server_resources
-                except asyncio.CancelledError:
-                    self.console.print(f"[yellow]Warning: Listing resources from {server_name} was cancelled; continuing without them[/yellow]")
-                except Exception as e:
-                    self.console.print(f"[yellow]Warning: Failed to list resources from {server_name}: {str(e)}[/yellow]")
-                try:
-                    templates_response = await client_obj.list_resource_templates()
-                    server_templates = templates_response.resource_templates if hasattr(templates_response, 'resource_templates') else []
-                    if server_templates:
-                        self.templates_by_server[server_name] = server_templates
-                except asyncio.CancelledError:
-                    self.console.print(f"[yellow]Warning: Listing resource templates from {server_name} was cancelled; continuing without them[/yellow]")
-                except Exception as e:
-                    self.console.print(f"[yellow]Warning: Failed to list resource templates from {server_name}: {str(e)}[/yellow]")
-                summary_parts = []
-                if server_resources:
-                    summary_parts.append(f"{len(server_resources)} resource(s)")
-                if server_templates:
-                    summary_parts.append(f"{len(server_templates)} template(s)")
-                if summary_parts:
-                    self.console.print(f"[dim]  {server_name}: {', '.join(summary_parts)}[/dim]")
-                else:
-                    self.console.print(f"[dim]  {server_name} has resources capability but returned none[/dim]")
-            else:
-                self.console.print(f"[dim]Server {server_name} does not support resources capability[/dim]")
-
-            prompt_count_msg = f" and {len(server_prompts)} prompt(s)" if server_prompts else ""
-            resource_count_msg = f" and {len(server_resources) + len(server_templates)} resource(s)/template(s)" if (server_resources or server_templates) else ""
-            self.console.print(f"[green]Successfully connected to {server_name} with {len(server_tools)} tool(s){prompt_count_msg}{resource_count_msg}[/green]")
-            return True
+            return True, None
 
         except asyncio.CancelledError:
             self._discard_server_state(server_name)
+            if dropped is not None:
+                # Unwinding the transport that died under a capability listing
+                # is what raised here. `dropped` is the real reason this attempt
+                # ended, and the caller retries without that listing.
+                return False, dropped
             if initialized:
                 self.console.print(
                     f"[red]Error connecting to {server_name}: Connection dropped after a "
@@ -315,24 +324,207 @@ class ServerConnector:
                     f"initialization. Verify the URL serves an MCP endpoint, not a regular web "
                     f"page or other service.[/red]"
                 )
-            return False
+            self._print_server_log_hint(log_path)
+            return False, None
         except FileNotFoundError as e:
             self._discard_server_state(server_name)
             self.console.print(f"[red]Error connecting to {server_name}: File not found - {str(e)}[/red]")
-            return False
+            self._print_server_log_hint(log_path)
+            return False, None
         except PermissionError:
             self._discard_server_state(server_name)
             self.console.print(f"[red]Error connecting to {server_name}: Permission denied[/red]")
-            return False
+            self._print_server_log_hint(log_path)
+            return False, None
         except Exception as e:
             self._discard_server_state(server_name)
-            sub_exceptions = getattr(e, 'exceptions', None)
-            if sub_exceptions:
-                for sub in sub_exceptions:
-                    self.console.print(f"[red]Error connecting to {server_name}: {str(sub)}[/red]")
+            if dropped is not None:
+                return False, dropped  # teardown noise from the dead transport, as above
+            for message in self._leaf_error_messages(e):
+                self.console.print(f"[red]Error connecting to {server_name}: {message}[/red]")
+            self._print_server_log_hint(log_path)
+            return False, None
+
+    async def _list_capabilities(self, session, server_name: str, init_result, skipped: set[str]) -> Optional[str]:
+        """Ask a freshly initialized server for everything it advertises.
+
+        Registers the tools, prompts, resources and templates it reports. A
+        listing that merely fails is a warning: the connection is still good.
+        A listing that gets *cancelled* is the transport dying underneath it,
+        and the caller has to unwind the connection before its cancelled scope
+        reaches the shared exit stack - hence the early return.
+
+        Args:
+            session: The initialized ClientSession
+            server_name: Name the server is registered under
+            init_result: Result of the initialize call, holding the capabilities
+            skipped: Capabilities not to query, because their listing already
+                dropped the connection on an earlier attempt
+
+        Returns:
+            The capability whose listing closed the connection, or None when
+            the server answered everything it advertised.
+        """
+        # Store the session
+        self.sessions[server_name] = {
+            "session": session,
+            "tools": []
+        }
+
+        capabilities = getattr(init_result, 'capabilities', None)
+
+        def advertises(name: str) -> bool:
+            """Whether this capability is worth a request: reported by the
+            server, and not one that already cost us the connection."""
+            return bool(capabilities and getattr(capabilities, name, None)) and name not in skipped
+
+        await self._apply_log_level(session, server_name, capabilities)
+
+        # Get tools from this server if capability is present
+        server_tools = []
+        if advertises("tools"):
+            try:
+                response = await session.list_tools()
+                # Store and merge tools, prepending server name to avoid conflicts
+                for tool in response.tools:
+                    # Create a qualified name for the tool that includes the server
+                    qualified_name = f"{server_name}.{tool.name}"
+                    # Clone the tool but update the name
+                    tool_copy = Tool(
+                        name=qualified_name,
+                        description=f"[{server_name}] {tool.description}" if hasattr(tool, 'description') else f"Tool from {server_name}",
+                        input_schema=tool.input_schema,
+                        output_schema=tool.output_schema
+                    )
+                    server_tools.append(tool_copy)
+                    self.enabled_tools[qualified_name] = True
+            except asyncio.CancelledError:
+                return "tools"
+            except Exception as e:
+                self.console.print(f"[yellow]Warning: Failed to list tools from {server_name}: {str(e)}[/yellow]")
+        elif "tools" not in skipped:
+            self.console.print(f"[dim]Server {server_name} does not support tools capability[/dim]")
+
+        self.sessions[server_name]["tools"] = server_tools
+        self.available_tools.extend(server_tools)
+
+        # Get prompts from this server if capability is present
+        server_prompts = []
+        if advertises("prompts"):
+            try:
+                prompts_response = await session.list_prompts()
+                server_prompts = prompts_response.prompts if hasattr(prompts_response, 'prompts') else []
+                if server_prompts:
+                    self.prompts_by_server[server_name] = server_prompts
+            except asyncio.CancelledError:
+                return "prompts"
+            except Exception as e:
+                self.console.print(f"[yellow]Warning: Failed to list prompts from {server_name}: {str(e)}[/yellow]")
+        elif "prompts" not in skipped:
+            self.console.print(f"[dim]Server {server_name} does not support prompts capability[/dim]")
+
+        # Get resources (static list + templates) if capability is present
+        server_resources = []
+        server_templates = []
+        if advertises("resources"):
+            try:
+                resources_response = await session.list_resources()
+                server_resources = resources_response.resources if hasattr(resources_response, 'resources') else []
+                if server_resources:
+                    self.resources_by_server[server_name] = server_resources
+            except asyncio.CancelledError:
+                return "resources"
+            except Exception as e:
+                self.console.print(f"[yellow]Warning: Failed to list resources from {server_name}: {str(e)}[/yellow]")
+            # Templates are a second request under the same capability, and a
+            # server can answer one and die on the other, so they are skipped
+            # on their own.
+            if "resource_templates" not in skipped:
+                try:
+                    templates_response = await session.list_resource_templates()
+                    server_templates = templates_response.resource_templates
+                    if server_templates:
+                        self.templates_by_server[server_name] = server_templates
+                except asyncio.CancelledError:
+                    return "resource_templates"
+                except Exception as e:
+                    self.console.print(f"[yellow]Warning: Failed to list resource templates from {server_name}: {str(e)}[/yellow]")
+            summary_parts = []
+            if server_resources:
+                summary_parts.append(f"{len(server_resources)} resource(s)")
+            if server_templates:
+                summary_parts.append(f"{len(server_templates)} template(s)")
+            if summary_parts:
+                self.console.print(f"[dim]  {server_name}: {', '.join(summary_parts)}[/dim]")
             else:
-                self.console.print(f"[red]Error connecting to {server_name}: {str(e)}[/red]")
+                self.console.print(f"[dim]  {server_name} has resources capability but returned none[/dim]")
+        elif "resources" not in skipped:
+            self.console.print(f"[dim]Server {server_name} does not support resources capability[/dim]")
+
+        prompt_count_msg = f" and {len(server_prompts)} prompt(s)" if server_prompts else ""
+        resource_count_msg = f" and {len(server_resources) + len(server_templates)} resource(s)/template(s)" if (server_resources or server_templates) else ""
+        self.console.print(f"[green]Successfully connected to {server_name} with {len(server_tools)} tool(s){prompt_count_msg}{resource_count_msg}[/green]")
+        return None
+
+    def _leaf_error_messages(self, exc: BaseException) -> list[str]:
+        """The messages of the real failures inside an exception.
+
+        A transport error surfaces wrapped in one ExceptionGroup per nested
+        TaskGroup, and only the leaves name a cause: unwrapping a single level
+        can still leave nothing but "unhandled errors in a TaskGroup".
+        """
+        sub_exceptions = getattr(exc, 'exceptions', None)
+        if not sub_exceptions:
+            return [str(exc) or type(exc).__name__]
+        return [message for sub in sub_exceptions for message in self._leaf_error_messages(sub)]
+
+    async def _apply_log_level(self, session, server_name: str, capabilities) -> None:
+        """Ask a server to only send log notifications from the wanted level up."""
+        if not self.log_level or not (capabilities and getattr(capabilities, 'logging', None)):
+            return
+        try:
+            # SEP-2577 deprecated the logging capability, so the SDK warns on every call.
+            # It stays the only way to set a level on a 2025-era server, which is the era
+            # ClientSession negotiates, and MCPDeprecationWarning subclasses UserWarning:
+            # left alone it prints to stderr over whatever is being rendered.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", MCPDeprecationWarning)
+                await session.set_logging_level(self.log_level)
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Failed to set log level on {server_name}: {str(e)}[/yellow]")
+
+    def _make_logging_callback(self, log_sink: ServerLogSink):
+        """Build the handler for the log notifications of one server."""
+        async def handle_log_message(params) -> None:
+            level = getattr(params, "level", "info")
+            logger_name = getattr(params, "logger", None)
+            source = f"{level} {logger_name}" if logger_name else level
+            data = params.data if isinstance(params.data, str) else repr(params.data)
+            log_sink.log(f"{source}: {data}", echo=self._shows_level(level))
+
+        return handle_log_message
+
+    def _shows_level(self, level: str) -> bool:
+        """Whether a notification at this level belongs on screen.
+
+        The level is also set on the server, but a server may ignore that and
+        send everything anyway, so the threshold is applied here too.
+        """
+        if not self.log_level:
             return False
+        if level not in MCP_LOG_LEVELS:
+            # A level the spec does not define: better shown than swallowed
+            return True
+        return MCP_LOG_LEVELS.index(level) >= MCP_LOG_LEVELS.index(self.log_level)
+
+    def _print_server_log_hint(self, log_path: Optional[str]) -> None:
+        """Point at a stdio server's log file, which now holds its stderr.
+
+        Whatever the server printed on its way out is in there instead of on
+        screen, and that is usually the actual reason the connection failed.
+        """
+        if log_path and os.path.exists(log_path) and os.path.getsize(log_path) > 0:
+            self.console.print(f"[dim]Server output: {log_path}[/dim]")
 
     def _create_script_params(self, server: Dict[str, Any]) -> Optional[StdioServerParameters]:
         """Create server parameters for a script-type server
@@ -533,7 +725,6 @@ class ServerConnector:
         """
         prefix = f"{server_name}."
         self.sessions.pop(server_name, None)
-        self.session_ids.pop(server_name, None)
         self.prompts_by_server.pop(server_name, None)
         self.resources_by_server.pop(server_name, None)
         self.templates_by_server.pop(server_name, None)
@@ -553,5 +744,4 @@ class ServerConnector:
         self.sessions.clear()
         self.available_tools.clear()
         self.enabled_tools.clear()
-        self.session_ids.clear()
         self.prompts_by_server.clear()

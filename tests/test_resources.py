@@ -255,11 +255,15 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
 
             server = {"name": "test-server", "type": "script", "path": "/tmp/test_server.py"}
 
-            mock_client = AsyncMock()
-            mock_client.server_capabilities = MagicMock()
-            mock_client.server_capabilities.tools = None
-            mock_client.server_capabilities.prompts = None
-            mock_client.server_capabilities.resources = MagicMock()
+            mock_session = AsyncMock()
+            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = False
+            mock_init_result = MagicMock()
+            mock_init_result.capabilities = MagicMock()
+            mock_init_result.capabilities.tools = None
+            mock_init_result.capabilities.prompts = None
+            mock_init_result.capabilities.resources = MagicMock()
 
             mock_resource = MagicMock()
             mock_resource.uri = "file:///test.txt"
@@ -275,15 +279,12 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
             mock_templates_response = MagicMock()
             mock_templates_response.resource_templates = [mock_template]
 
-            mock_client.list_resources.return_value = mock_resources_response
-            mock_client.list_resource_templates.return_value = mock_templates_response
-
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_client
-            mock_cm.__aexit__.return_value = False
+            mock_session.initialize.return_value = mock_init_result
+            mock_session.list_resources.return_value = mock_resources_response
+            mock_session.list_resource_templates.return_value = mock_templates_response
 
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.Client', return_value=mock_cm), \
+                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
                 mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -296,8 +297,8 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
                 assert connector.resources_by_server["test-server"][0].uri == "file:///test.txt"
                 assert "test-server" in connector.templates_by_server
                 assert connector.templates_by_server["test-server"][0].uri_template == "file:///{path}"
-                mock_client.list_resources.assert_called_once()
-                mock_client.list_resource_templates.assert_called_once()
+                mock_session.list_resources.assert_called_once()
+                mock_session.list_resource_templates.assert_called_once()
 
     async def test_server_without_resources_capability(self):
         """No resources or templates fetched when server lacks the capability."""
@@ -306,18 +307,20 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
 
             server = {"name": "test-server", "type": "script", "path": "/tmp/test_server.py"}
 
-            mock_client = AsyncMock()
-            mock_client.server_capabilities = MagicMock()
-            mock_client.server_capabilities.tools = None
-            mock_client.server_capabilities.prompts = None
-            mock_client.server_capabilities.resources = None
+            mock_session = AsyncMock()
+            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = False
+            mock_init_result = MagicMock()
+            mock_init_result.capabilities = MagicMock()
+            mock_init_result.capabilities.tools = None
+            mock_init_result.capabilities.prompts = None
+            mock_init_result.capabilities.resources = None
 
-            mock_cm = AsyncMock()
-            mock_cm.__aenter__.return_value = mock_client
-            mock_cm.__aexit__.return_value = False
+            mock_session.initialize.return_value = mock_init_result
 
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.Client', return_value=mock_cm), \
+                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
                 mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -328,8 +331,8 @@ class TestResourceCapability(unittest.IsolatedAsyncioTestCase):
                 assert result is True
                 assert "test-server" not in connector.resources_by_server
                 assert "test-server" not in connector.templates_by_server
-                mock_client.list_resources.assert_not_called()
-                mock_client.list_resource_templates.assert_not_called()
+                mock_session.list_resources.assert_not_called()
+                mock_session.list_resource_templates.assert_not_called()
 
 
 if __name__ == '__main__':

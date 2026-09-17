@@ -12,7 +12,7 @@
 
 # MCP Client for Ollama (ollmcp)
 
-![PyPI - Downloads](https://img.shields.io/pypi/dm/mcp-client-for-ollama?cacheSeconds=1)
+![Pepy Total Downloads](https://img.shields.io/pepy/dt/mcp-client-for-ollama?label=Downloads)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI - Python Version](https://img.shields.io/pypi/v/ollmcp?label=ollmcp)](https://pypi.org/project/ollmcp/)
 [![PyPI - Python Version](https://img.shields.io/pypi/v/mcp-client-for-ollama?label=mcp-client-for-ollama)](https://pypi.org/project/mcp-client-for-ollama/)
@@ -321,6 +321,28 @@ The `project` scope writes a standard `.mcp.json` file at your project root, com
 - `--install-completion`: Install shell autocompletion scripts for the client
 - `--show-completion`: Show available shell completion options
 
+#### MCP Server Logging:
+
+Whatever an MCP server reports is written to `~/.config/ollmcp/logs/<session>/<server>.log`, one directory per run, keeping the last 5. **Nothing a server prints reaches the screen unless you ask for it** — otherwise it would draw over the answer being streamed.
+
+Servers report through two channels: their **stderr** (only stdio servers, since a remote one runs elsewhere) and **MCP log notifications** (any server). **Both flags only change what you see on screen — the log file gets everything either way:**
+
+| | written to the log file | shown on screen |
+|---|---|---|
+| *(no flag)* | everything the server sends | nothing from the server |
+| `--debug` | everything the server sends | all of it, as it arrives |
+| `--log-level LEVEL` | everything the server sends | only notifications of LEVEL or higher |
+| `--debug --log-level LEVEL` | everything the server sends | stderr in full + notifications of LEVEL or higher |
+
+LEVEL is one of `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`.
+
+With no flag, no level is requested at all: the server decides what it emits and all of it is recorded. `--log-level` filters what you see, and is also sent to the server (`logging/setLevel`) when it advertises the logging capability — such a server may then stop emitting the lower levels, which are missing from the file too. Servers without that capability keep sending everything and the filtering happens here.
+
+When a server fails to connect, the error points at its log file: whatever the server printed on its way out is in there, and that is usually the real reason.
+
+> [!NOTE]
+> What ollmcp itself reports goes to `~/.config/ollmcp/logs/<session>/ollmcp.log`, next to the server files. It is written on every run, no `--debug` needed, and it is the file the on-screen warning points at when a response stream ends early. Work in progress: for now it records mostly provider and streaming errors, and more will be logged there over time.
+
 ### Supported Inference Providers
 
 > [!WARNING]
@@ -524,7 +546,7 @@ During chat, use these commands:
 | Command          | Shortcut         | Description                                         |
 |------------------|------------------|-----------------------------------------------------|
 | `abort`          | `a`              | While model is generating, abort the current response generation |
-| `/clear`         | `/cc`            | Clear conversation history and context              |
+| `/clear`, `/new` | `/cc`            | Clear conversation history and context              |
 | `/cls`           | `/clear-screen`  | Clear the terminal screen                           |
 | `/context`       | `/c`             | Toggle context retention                            |
 | `/context-info`  | `/ci`            | Display context statistics                          |
@@ -1081,7 +1103,7 @@ The following settings are **shared** across all providers:
 
 ## Server Configuration Format
 
-The JSON configuration file supports STDIO, SSE, and Streamable HTTP server types (MCP Python SDK 2.0+):
+The JSON configuration file supports STDIO, SSE, and Streamable HTTP server types (MCP 1.10.1):
 
 ```json
 {
@@ -1115,7 +1137,7 @@ The JSON configuration file supports STDIO, SSE, and Streamable HTTP server type
 }
 ```
 > [!NOTE]
-> **MCP Python SDK 2.0**: The client runs on the mcp Python SDK's v2 line, which negotiates the protocol version automatically per server (supporting both the 2025-11-25 and 2026-07-28 revisions). If you specify a URL without a type, the client will default to using Streamable HTTP transport.
+> **MCP 1.10.1 Transport Support**: The client now supports the latest Streamable HTTP transport with improved performance and reliability. If you specify a URL without a type, the client will default to using Streamable HTTP transport.
 
 ### Tips: where to put MCP server configs and a working example
 
@@ -1168,10 +1190,17 @@ A short demo (asciicast) that should help anyone reproduce the working setup qui
 
 #### Common MCP endpoint paths
 
-Streamable HTTP MCP servers typically expose the MCP endpoint at `/mcp` (e.g., `https://host/mcp`), while SSE servers commonly use `/sse` (e.g., `https://host/sse`). Below is an excerpt from the MCP specification:
+Streamable HTTP MCP servers typically expose the MCP endpoint at `/mcp` (e.g., `https://host/mcp`), while SSE servers commonly use `/sse` (e.g., `https://host/sse`). Below is an excerpt from the MCP specification (2025-06-18):
 > The server MUST provide a single HTTP endpoint path (hereafter referred to as the MCP endpoint) that supports both POST and GET methods. For example, this could be a URL like https://example.com/mcp.
 
-You can find more details in the [MCP specification - Transports](https://modelcontextprotocol.io/specification/latest/basic/transports).
+You can find more details in the [MCP specification version 2025-06-18 - Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
+
+> [!NOTE]
+> HTTPS certificates for remote MCP servers are verified against your **operating system trust store**, not the `certifi` bundle. If an MCP server sits behind a private or corporate CA, or you run ollmcp in a minimal container with no system CA store, the TLS handshake fails with an error that does not mention ollmcp. Point `SSL_CERT_FILE` (a bundle file) or `SSL_CERT_DIR` (a directory) at your CA to fix it:
+>
+> ```bash
+> export SSL_CERT_FILE=/path/to/corporate-ca.pem
+> ```
 
 ## Compatible Models
 

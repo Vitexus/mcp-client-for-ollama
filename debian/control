@@ -8,6 +8,7 @@ Build-Depends:
  pybuild-plugin-pyproject,
  python3-all,
  python3-setuptools,
+ python3-any-llm-sdk (>= 1.21.0),
  python3-mcp (>= 1:2.0.0),
  python3-rich,
 Standards-Version: 4.7.0
@@ -23,8 +24,9 @@ Depends:
  ${misc:Depends},
  ${python3:Depends},
  python3 (>= 3.10),
+ python3-any-llm-sdk (>= 1.21.0),
  python3-mcp (>= 1:2.0.0),
- python3-ollama,
+ python3-ollama (>= 0.6.0),
  python3-prompt-toolkit,
  python3-rich,
  python3-typer,

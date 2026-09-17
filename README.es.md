@@ -325,6 +325,28 @@ El ámbito `project` escribe un archivo `.mcp.json` estándar en la raíz de tu 
 - `--install-completion`: Instalar los scripts de autocompletado de shell para el cliente
 - `--show-completion`: Mostrar las opciones de autocompletado de shell disponibles
 
+#### Logs de los servidores MCP:
+
+Todo lo que reporta un servidor MCP se escribe en `~/.config/ollmcp/logs/<sesión>/<servidor>.log`, un directorio por ejecución, conservando los últimos 5. **Nada de lo que imprime un servidor llega a la pantalla salvo que lo pidas** — si no, dibujaría encima de la respuesta que se está transmitiendo.
+
+Los servidores reportan por dos canales: su **stderr** (solo los servidores stdio, porque uno remoto corre en otro lado) y las **notificaciones de log MCP** (cualquier servidor). **Las dos opciones solo cambian lo que ves en pantalla — el archivo recibe todo igual:**
+
+| | se escribe en el archivo | se muestra en pantalla |
+|---|---|---|
+| *(sin opciones)* | todo lo que manda el servidor | nada del servidor |
+| `--debug` | todo lo que manda el servidor | todo eso, a medida que llega |
+| `--log-level NIVEL` | todo lo que manda el servidor | solo las notificaciones de ese nivel o superior |
+| `--debug --log-level NIVEL` | todo lo que manda el servidor | stderr completo + notificaciones de ese nivel o superior |
+
+NIVEL es uno de `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`.
+
+Sin opciones no se pide ningún nivel: decide el servidor qué emite, y todo queda registrado. `--log-level` filtra lo que ves, y además se le envía al servidor (`logging/setLevel`) cuando este anuncia la capability de logging — ahí el servidor puede dejar de emitir los niveles más bajos, que entonces tampoco aparecen en el archivo. Los servidores sin esa capability siguen mandando todo y el filtrado ocurre acá.
+
+Cuando un servidor no logra conectarse, el error apunta a su archivo de log: lo que el servidor haya impreso antes de morir está ahí, y suele ser la razón real.
+
+> [!NOTE]
+> Lo que reporta el propio ollmcp va a `~/.config/ollmcp/logs/<sesión>/ollmcp.log`, junto a los archivos de los servidores. Se escribe en cada ejecución, sin necesidad de `--debug`, y es el archivo al que apunta el aviso en pantalla cuando una respuesta se corta antes de terminar. Work in progress: por ahora registra sobre todo errores del proveedor y del streaming, y con el tiempo se irá loggeando más.
+
 ### Proveedores de inferencia soportados
 
 > [!WARNING]
@@ -528,7 +550,7 @@ Durante el chat, usa estos comandos:
 | Comando          | Atajo            | Descripción                                         |
 |------------------|------------------|-----------------------------------------------------|
 | `abort`          | `a`              | Mientras el modelo genera, aborta la generación de la respuesta actual |
-| `/clear`         | `/cc`            | Limpiar el historial de conversación y el contexto  |
+| `/clear`, `/new` | `/cc`            | Limpiar el historial de conversación y el contexto  |
 | `/cls`           | `/clear-screen`  | Limpiar la pantalla del terminal                    |
 | `/context`       | `/c`             | Alternar la retención de contexto                   |
 | `/context-info`  | `/ci`            | Mostrar estadísticas del contexto                   |
@@ -1085,7 +1107,7 @@ Los siguientes ajustes son **compartidos** entre todos los proveedores:
 
 ## Formato de configuración de servidores
 
-El archivo de configuración JSON soporta los tipos de servidor STDIO, SSE y Streamable HTTP (MCP Python SDK 2.0+):
+El archivo de configuración JSON soporta los tipos de servidor STDIO, SSE y Streamable HTTP (MCP 1.10.1):
 
 ```json
 {
@@ -1119,7 +1141,7 @@ El archivo de configuración JSON soporta los tipos de servidor STDIO, SSE y Str
 }
 ```
 > [!NOTE]
-> **MCP Python SDK 2.0**: El cliente funciona sobre la línea v2 del SDK de Python de mcp, que negocia automáticamente la versión del protocolo con cada servidor (soportando las revisiones 2025-11-25 y 2026-07-28). Si especificas una URL sin tipo, el cliente usará por defecto el transporte Streamable HTTP.
+> **Soporte de transporte MCP 1.10.1**: El cliente ahora soporta el último transporte Streamable HTTP con mejor rendimiento y fiabilidad. Si especificas una URL sin tipo, el cliente usará por defecto el transporte Streamable HTTP.
 
 ### Consejos: dónde poner las configuraciones de servidores MCP y un ejemplo funcional
 
@@ -1172,10 +1194,17 @@ Una demo corta (asciicast) que debería ayudar a cualquiera a reproducir rápida
 
 #### Rutas comunes de endpoints MCP
 
-Los servidores MCP Streamable HTTP típicamente exponen el endpoint MCP en `/mcp` (p. ej., `https://host/mcp`), mientras que los servidores SSE suelen usar `/sse` (p. ej., `https://host/sse`). Abajo hay un extracto de la especificación MCP:
+Los servidores MCP Streamable HTTP típicamente exponen el endpoint MCP en `/mcp` (p. ej., `https://host/mcp`), mientras que los servidores SSE suelen usar `/sse` (p. ej., `https://host/sse`). Abajo hay un extracto de la especificación MCP (2025-06-18):
 > The server MUST provide a single HTTP endpoint path (hereafter referred to as the MCP endpoint) that supports both POST and GET methods. For example, this could be a URL like https://example.com/mcp.
 
-Puedes encontrar más detalles en la [especificación MCP - Transports](https://modelcontextprotocol.io/specification/latest/basic/transports).
+Puedes encontrar más detalles en la [especificación MCP versión 2025-06-18 - Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
+
+> [!NOTE]
+> Los certificados HTTPS de los servidores MCP remotos se validan contra el **almacén de confianza del sistema operativo**, no contra el paquete `certifi`. Si un servidor MCP está detrás de una CA privada o corporativa, o ejecutas ollmcp en un contenedor mínimo sin almacén de CA del sistema, el handshake TLS falla con un error que no menciona a ollmcp. Apunta `SSL_CERT_FILE` (un archivo de bundle) o `SSL_CERT_DIR` (un directorio) a tu CA para solucionarlo:
+>
+> ```bash
+> export SSL_CERT_FILE=/ruta/a/ca-corporativa.pem
+> ```
 
 ## Modelos compatibles
 

@@ -10,6 +10,36 @@ from mcp_client_for_ollama.utils.constants import MCP_PROTOCOL_VERSION
 from contextlib import AsyncExitStack
 
 
+def test_protocol_version_header_is_the_negotiable_revision():
+    """The advertised revision must be one the initialize handshake can negotiate.
+
+    Every other header test compares against MCP_PROTOCOL_VERSION itself, so none of
+    them notices when the constant changes value. SDK v2 redefined
+    LATEST_PROTOCOL_VERSION to mean the newest revision the SDK speaks in any era
+    ("2026-07-28"), which initialize never negotiates -- sourcing the header from it
+    would silently advertise a revision the connection did not agree on.
+    """
+    assert MCP_PROTOCOL_VERSION == "2025-11-25"
+
+
+def test_leaf_error_messages_unwraps_nested_groups():
+    """A transport failure must name its cause, however deeply it is wrapped.
+
+    mcp 2.x runs the streamable-HTTP transport inside nested TaskGroups, so a
+    server answering with a plain web page arrives as an ExceptionGroup holding
+    another ExceptionGroup. Unwrapping one level printed only "unhandled errors
+    in a TaskGroup", which says nothing about what went wrong.
+    """
+    connector = ServerConnector(AsyncExitStack())
+    cause = RuntimeError("Unexpected content type: text/html")
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [cause])])
+
+    assert connector._leaf_error_messages(nested) == ["Unexpected content type: text/html"]
+    assert connector._leaf_error_messages(cause) == ["Unexpected content type: text/html"]
+    # An exception carrying no message still has to identify itself.
+    assert connector._leaf_error_messages(ConnectionResetError()) == ["ConnectionResetError"]
+
+
 def test_get_headers_from_server_sse():
     """Test that headers are correctly extracted and formatted for SSE servers."""
     connector = ServerConnector(AsyncExitStack())
@@ -215,14 +245,6 @@ def test_get_url_from_server():
     assert connector._get_url_from_server(server) is None
 
 
-def _mock_client_cm(mock_client):
-    """Wrap an entered-client mock in the async-context-manager Client(...) returns."""
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__.return_value = mock_client
-    mock_cm.__aexit__.return_value = False
-    return mock_cm
-
-
 class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
     """Test capability-based feature detection."""
 
@@ -238,15 +260,20 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
                 "path": "/fake/path.py"
             }
 
-            # Mock the entered Client and its post-handshake capabilities
-            mock_client = AsyncMock()
-            mock_client.server_capabilities = MagicMock()
-            mock_client.server_capabilities.tools = None  # No tools capability
-            mock_client.server_capabilities.prompts = None
+            # Mock the session and initialization
+            mock_session = AsyncMock()
+            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = False
+            mock_init_result = MagicMock()
+            mock_init_result.capabilities = MagicMock()
+            mock_init_result.capabilities.tools = None  # No tools capability
+            mock_init_result.capabilities.prompts = None
+            mock_session.initialize.return_value = mock_init_result
 
-            # Mock the transport and Client creation
+            # Mock the transport and session creation
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.Client', return_value=_mock_client_cm(mock_client)), \
+                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
                 mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -259,7 +286,7 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
                 assert result is True
                 assert "test-server" in connector.sessions
                 assert connector.sessions["test-server"]["tools"] == []
-                assert mock_client.list_tools.call_count == 0  # Should not call list_tools
+                assert mock_session.list_tools.call_count == 0  # Should not call list_tools
 
     async def test_server_without_prompts_capability(self):
         """Test that connection succeeds when server doesn't support prompts."""
@@ -273,20 +300,25 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
                 "path": "/fake/path.py"
             }
 
-            # Mock the entered Client and its post-handshake capabilities
-            mock_client = AsyncMock()
-            mock_client.server_capabilities = MagicMock()
-            mock_client.server_capabilities.tools = MagicMock()  # Has tools
-            mock_client.server_capabilities.prompts = None  # No prompts capability
+            # Mock the session and initialization
+            mock_session = AsyncMock()
+            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = False
+            mock_init_result = MagicMock()
+            mock_init_result.capabilities = MagicMock()
+            mock_init_result.capabilities.tools = MagicMock()  # Has tools
+            mock_init_result.capabilities.prompts = None  # No prompts capability
 
             # Mock list_tools response
             mock_tools_response = MagicMock()
             mock_tools_response.tools = []
-            mock_client.list_tools.return_value = mock_tools_response
+            mock_session.initialize.return_value = mock_init_result
+            mock_session.list_tools.return_value = mock_tools_response
 
-            # Mock the transport and Client creation
+            # Mock the transport and session creation
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.Client', return_value=_mock_client_cm(mock_client)), \
+                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
                 mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -299,7 +331,7 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
                 assert result is True
                 assert "test-server" in connector.sessions
                 assert "test-server" not in connector.prompts_by_server
-                assert mock_client.list_prompts.call_count == 0  # Should not call list_prompts
+                assert mock_session.list_prompts.call_count == 0  # Should not call list_prompts
 
     async def test_server_with_all_capabilities(self):
         async with AsyncExitStack() as stack:
@@ -312,12 +344,16 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
                 "path": "/fake/path.py"
             }
 
-            # Mock the entered Client and its post-handshake capabilities
-            mock_client = AsyncMock()
-            mock_client.server_capabilities = MagicMock()
-            mock_client.server_capabilities.tools = MagicMock()  # Has tools
-            mock_client.server_capabilities.prompts = MagicMock()  # Has prompts
-            mock_client.server_capabilities.resources = MagicMock()  # Has resources (not used yet)
+            # Mock the session and initialization
+            mock_session = AsyncMock()
+            # __aenter__ yields this mock; falsy __aexit__ so it can't swallow assertions.
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = False
+            mock_init_result = MagicMock()
+            mock_init_result.capabilities = MagicMock()
+            mock_init_result.capabilities.tools = MagicMock()  # Has tools
+            mock_init_result.capabilities.prompts = MagicMock()  # Has prompts
+            mock_init_result.capabilities.resources = MagicMock()  # Has resources (not used yet)
 
             # Mock list_tools response
             mock_tool = MagicMock()
@@ -326,18 +362,20 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
             mock_tool.input_schema = {}
             mock_tools_response = MagicMock()
             mock_tools_response.tools = [mock_tool]
-            mock_client.list_tools.return_value = mock_tools_response
+            mock_session.list_tools.return_value = mock_tools_response
 
             # Mock list_prompts response
             mock_prompt = MagicMock()
             mock_prompt.name = "test_prompt"
             mock_prompts_response = MagicMock()
             mock_prompts_response.prompts = [mock_prompt]
-            mock_client.list_prompts.return_value = mock_prompts_response
+            mock_session.list_prompts.return_value = mock_prompts_response
 
-            # Mock the transport and Client creation
+            mock_session.initialize.return_value = mock_init_result
+
+            # Mock the transport and session creation
             with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-                 patch('mcp_client_for_ollama.server.connector.Client', return_value=_mock_client_cm(mock_client)), \
+                 patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
                  patch.object(connector, '_create_script_params', return_value=MagicMock()), \
                  patch('mcp_client_for_ollama.server.connector.Tool') as mock_tool_class:
 
@@ -356,9 +394,9 @@ class TestCapabilityHandling(unittest.IsolatedAsyncioTestCase):
                 assert len(connector.sessions["test-server"]["tools"]) == 1
                 assert "test-server" in connector.prompts_by_server
                 assert len(connector.prompts_by_server["test-server"]) == 1
-                assert mock_client.list_tools.call_count == 1
-                assert mock_client.list_tools.call_count == 1
-            assert mock_client.list_prompts.call_count == 1
+                assert mock_session.list_tools.call_count == 1
+                assert mock_session.list_tools.call_count == 1
+            assert mock_session.list_prompts.call_count == 1
 
 
 class TestConnectToServersMerging(unittest.IsolatedAsyncioTestCase):
@@ -422,14 +460,18 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
     """A cancellation raised after the handshake must not be reported as the
     server failing to answer initialize, and must not abort the connection (#274)."""
 
-    def _mock_client(self, *, tools=True, prompts=False, resources=True):
-        """Build an entered-Client mock whose capabilities match a server's advertisement."""
-        mock_client = AsyncMock()
+    def _mock_session(self, *, tools=True, prompts=False, resources=True):
+        """Build a session mock whose capabilities match a server's advertisement."""
+        mock_session = AsyncMock()
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = False
 
-        mock_client.server_capabilities = MagicMock()
-        mock_client.server_capabilities.tools = MagicMock() if tools else None
-        mock_client.server_capabilities.prompts = MagicMock() if prompts else None
-        mock_client.server_capabilities.resources = MagicMock() if resources else None
+        mock_init_result = MagicMock()
+        mock_init_result.capabilities = MagicMock()
+        mock_init_result.capabilities.tools = MagicMock() if tools else None
+        mock_init_result.capabilities.prompts = MagicMock() if prompts else None
+        mock_init_result.capabilities.resources = MagicMock() if resources else None
+        mock_session.initialize.return_value = mock_init_result
 
         mock_tool = MagicMock()
         mock_tool.name = "spawn_actor"
@@ -438,19 +480,15 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
         mock_tool.output_schema = None
         mock_tools_response = MagicMock()
         mock_tools_response.tools = [mock_tool]
-        mock_client.list_tools.return_value = mock_tools_response
+        mock_session.list_tools.return_value = mock_tools_response
 
-        return mock_client
+        return mock_session
 
-    async def _connect(self, connector, mock_client, *, aenter_side_effect=None):
-        """Run a stdio connection against the given entered-Client mock."""
+    async def _connect(self, connector, mock_session):
+        """Run a stdio connection against the given session mock."""
         server = {"name": "unreal-mcp", "type": "script", "path": "/fake/path.py"}
-        mock_cm = _mock_client_cm(mock_client)
-        if aenter_side_effect is not None:
-            mock_cm.__aenter__.side_effect = aenter_side_effect
-
         with patch('mcp_client_for_ollama.server.connector.stdio_client') as mock_stdio, \
-             patch('mcp_client_for_ollama.server.connector.Client', return_value=mock_cm), \
+             patch('mcp_client_for_ollama.server.connector.ClientSession', return_value=mock_session), \
              patch.object(connector, '_create_script_params', return_value=MagicMock()):
 
             mock_stdio.return_value.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
@@ -465,10 +503,10 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
         console = Console(record=True, width=200)
         async with AsyncExitStack() as stack:
             connector = ServerConnector(stack, console=console)
-            mock_client = self._mock_client()
-            mock_client.list_resources.side_effect = asyncio.CancelledError()
+            mock_session = self._mock_session()
+            mock_session.list_resources.side_effect = asyncio.CancelledError()
 
-            result = await self._connect(connector, mock_client)
+            result = await self._connect(connector, mock_session)
 
         output = console.export_text()
         assert result is True, "one broken capability query must not fail the connection"
@@ -477,14 +515,14 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
         assert HANDSHAKE_ERROR not in output, "initialize succeeded; do not blame the URL"
 
     async def test_cancellation_during_initialize_reports_handshake_failure(self):
-        """The original message is still used when the handshake itself is cancelled."""
+        """The original message is still used when initialize itself is cancelled."""
         console = Console(record=True, width=200)
         async with AsyncExitStack() as stack:
             connector = ServerConnector(stack, console=console)
-            mock_client = self._mock_client()
+            mock_session = self._mock_session()
+            mock_session.initialize.side_effect = asyncio.CancelledError()
 
-            # The handshake now happens inside Client's own __aenter__.
-            result = await self._connect(connector, mock_client, aenter_side_effect=asyncio.CancelledError())
+            result = await self._connect(connector, mock_session)
 
         assert result is False
         assert HANDSHAKE_ERROR in console.export_text()
@@ -495,13 +533,13 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
         console = Console(record=True, width=200)
         async with AsyncExitStack() as stack:
             connector = ServerConnector(stack, console=console)
-            mock_client = self._mock_client()
+            mock_session = self._mock_session()
 
             # Cancel while handing the transport over to the long-lived exit stack,
-            # i.e. after Client's own __aenter__ (the handshake) has already returned.
+            # i.e. after initialize() has already returned.
             with patch.object(connector.exit_stack, 'enter_async_context',
                               side_effect=asyncio.CancelledError()):
-                result = await self._connect(connector, mock_client)
+                result = await self._connect(connector, mock_session)
 
         output = console.export_text()
         assert result is False
@@ -513,7 +551,7 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
         client keeps offering tools for a server it reported as unreachable."""
         async with AsyncExitStack() as stack:
             connector = ServerConnector(stack)
-            mock_client = self._mock_client()
+            mock_session = self._mock_session()
 
             # A malformed resources payload: truthy, but len() raises when the
             # summary line is built, after tools were already registered.
@@ -523,9 +561,9 @@ class TestPostInitCancellation(unittest.IsolatedAsyncioTestCase):
 
             mock_resources_response = MagicMock()
             mock_resources_response.resources = MalformedResources()
-            mock_client.list_resources.return_value = mock_resources_response
+            mock_session.list_resources.return_value = mock_resources_response
 
-            result = await self._connect(connector, mock_client)
+            result = await self._connect(connector, mock_session)
 
         assert result is False
         assert connector.sessions == {}

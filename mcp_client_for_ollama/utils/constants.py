@@ -1,7 +1,7 @@
 """Constants used throughout the MCP Client for Ollama application."""
 
 import os
-from mcp.types import LATEST_PROTOCOL_VERSION
+from mcp.types.version import LATEST_HANDSHAKE_VERSION
 
 # Default Claude config file location
 DEFAULT_CLAUDE_CONFIG = os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json")
@@ -12,6 +12,14 @@ if not os.path.exists(DEFAULT_CONFIG_DIR):
     os.makedirs(DEFAULT_CONFIG_DIR)
 
 DEFAULT_CONFIG_FILE = "config.json"
+
+# Log files of the MCP servers, one directory per ollmcp session
+SERVER_LOG_DIR = os.path.join(DEFAULT_CONFIG_DIR, "logs")
+# How many past sessions to keep there
+KEPT_LOG_SESSIONS = 5
+
+# Levels of the MCP logging channel, least to most severe (RFC 5424)
+MCP_LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
 
 # MCP server registry files managed by `ollmcp mcp add/list/remove`
 # User scope: global, available across all projects
@@ -52,10 +60,13 @@ MAX_COMPLETION_MENU_ROWS = 7
 # URL for checking package updates on PyPI
 PYPI_PACKAGE_URL = "https://pypi.org/pypi/mcp-client-for-ollama/json"
 
-# MCP Protocol Version - Using SDK's latest supported version (currently "2025-11-25")
+# MCP Protocol Version - the revision the initialize handshake offers (currently "2025-11-25").
 # The SDK handles backward compatibility with servers on older protocol versions:
 # Supported versions: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
-MCP_PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
+# Deliberately not LATEST_PROTOCOL_VERSION: since SDK v2 that name means the newest revision
+# the SDK speaks in any era ("2026-07-28"), which initialize cannot negotiate. Advertising it
+# in the header would claim a revision the connection never agreed on.
+MCP_PROTOCOL_VERSION = LATEST_HANDSHAKE_VERSION
 
 # Startup ASCII banner shown when launching ollmcp
 OLLMCP_ASCII_ART = r"""
@@ -72,12 +83,10 @@ OLLMCP_ASCII_ART = r"""
 
 # Interactive commands and their descriptions for autocomplete
 INTERACTIVE_COMMANDS = {
-    'bye': 'Exit the application',
     'clear-screen': 'Clear terminal screen',
     'clear': 'Clear conversation context',
     'context-info': 'Show context information',
     'context': 'Toggle context retention',
-    'exit': 'Exit the application',
     'export-history': 'Export chat history to JSON',
     'full-history': 'View full conversation history',
     'help': 'Show help information',
@@ -101,6 +110,13 @@ INTERACTIVE_COMMANDS = {
     'show-tool-execution': 'Toggle tool execution display',
     'thinking-mode': 'Toggle thinking mode',
     'tools': 'Configure available tools'
+}
+
+# Extra names that run the same command. They are matched by autocomplete and
+# listed next to the canonical name (e.g. '/clear, /new').
+COMMAND_ALT_NAMES = {
+    'clear': ['new'],
+    'quit': ['exit', 'bye'],
 }
 
 # Default completion menu style (used by prompt_toolkit in interactive mode)

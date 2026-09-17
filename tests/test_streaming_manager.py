@@ -3,8 +3,11 @@
 import os
 import unittest
 from dataclasses import dataclass
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from rich.console import Console
 
 from mcp_client_for_ollama.utils.streaming import (
     BlockMarkdownRenderer,
@@ -36,6 +39,7 @@ class DummyChunk:
 
     choices: list
     usage: object = None
+    error: object = None
 
 
 async def _stream_chunks(*chunks):
@@ -282,6 +286,363 @@ class TestStreamingManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(thinking_call.kwargs.get("end"), "")
         self.assertEqual(calls[-1].args, ())
         self.assertEqual(calls[-1].kwargs, {})
+
+    async def test_whitespace_only_reasoning_prints_no_thinking_header(self):
+        # A provider that only ever sends whitespace in its reasoning deltas
+        # used to get the "Thinking:" header rendered above an empty body.
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.Markdown", side_effect=lambda text: f"MD::{text}"), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics",
+            return_value=None,
+        ):
+            response_text, _, _ = await manager.process_streaming_response(
+                _stream_chunks(
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning=" "))]),
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning="\n"))]),
+                    DummyChunk(choices=[DummyChoice(DummyDelta(content="answer"))]),
+                ),
+                thinking_mode=True,
+                show_thinking=True,
+                answer_render_mode="plain",
+            )
+
+        printed = [call.args[0] for call in self.console.print.call_args_list if call.args]
+        self.assertEqual(response_text, "answer")
+        self.assertFalse(any("\U0001f914" in str(item) for item in printed))
+
+    async def test_leading_whitespace_reasoning_flushes_with_first_visible_text(self):
+        # The whitespace held back before the first visible delta must not
+        # reappear as a gap under the header, but spacing between words does.
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.Markdown", side_effect=lambda text: f"MD::{text}"), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics",
+            return_value=None,
+        ):
+            await manager.process_streaming_response(
+                _stream_chunks(
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning="\n\n"))]),
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning="plan"))]),
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning=" "))]),
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning="ning"))]),
+                ),
+                thinking_mode=True,
+                show_thinking=True,
+                answer_render_mode="plain",
+            )
+
+        streamed = [
+            call.args[0] for call in self.console.print.call_args_list
+            if call.args and call.kwargs.get("end") == ""
+        ]
+        self.assertEqual(streamed, ["plan", " ning"])
+
+    async def test_bracketed_reasoning_is_escaped_before_printing(self):
+        # Rich would parse "[dim]" as markup and print nothing for it, and a
+        # raw ESC from the provider could spoof the terminal.
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.Markdown", side_effect=lambda text: f"MD::{text}"), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics",
+            return_value=None,
+        ):
+            await manager.process_streaming_response(
+                _stream_chunks(
+                    DummyChunk(choices=[DummyChoice(DummyDelta(reasoning="\x1b[2Jstep [dim]one"))]),
+                ),
+                thinking_mode=True,
+                show_thinking=True,
+                answer_render_mode="plain",
+            )
+
+        streamed = [
+            call.args[0] for call in self.console.print.call_args_list
+            if call.args and call.kwargs.get("end") == ""
+        ]
+        self.assertEqual(streamed, ["[2Jstep \\[dim]one"])
+
+    async def test_tool_call_survives_stream_ending_without_finish_reason(self):
+        # Some providers close the stream without ever sending a finish_reason.
+        # A fully received tool call must still be reported.
+        tool_call = SimpleNamespace(
+            index=0, id="call_1",
+            function=SimpleNamespace(name="time.get_current_time", arguments="{}"),
+        )
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            _, tool_calls, _ = await manager.process_streaming_response(
+                _stream_chunks(
+                    DummyChunk(choices=[DummyChoice(DummyDelta(tool_calls=[tool_call]))]),
+                ),
+                print_response=False,
+            )
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["function"]["name"], "time.get_current_time")
+
+    async def test_failing_chunk_keeps_partial_output_and_warns(self):
+        # A chunk that fails to parse closes the provider's generator, so the
+        # stream is over. Keep what arrived and surface the error instead of
+        # returning an empty response with no explanation.
+        tool_call = SimpleNamespace(
+            index=0, id="call_1",
+            function=SimpleNamespace(name="time.get_current_time", arguments="{}"),
+        )
+
+        async def failing_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(tool_calls=[tool_call]))])
+            raise ValueError("bad chunk")
+
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.Markdown", side_effect=lambda text: f"MD::{text}"), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics",
+            return_value=None,
+        ):
+            response_text, tool_calls, _ = await manager.process_streaming_response(
+                failing_stream(),
+                answer_render_mode="plain",
+            )
+
+        printed = " ".join(str(call.args[0]) for call in self.console.print.call_args_list if call.args)
+
+        self.assertEqual(response_text, "partial ")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertIn("ended early", printed)
+        self.assertIn("bad chunk", printed)
+
+    async def test_failing_chunk_is_silent_when_not_printing(self):
+        async def failing_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            raise ValueError("bad chunk")
+
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            response_text, tool_calls, _ = await manager.process_streaming_response(
+                failing_stream(),
+                print_response=False,
+            )
+
+        self.assertEqual(response_text, "partial ")
+        self.assertEqual(tool_calls, [])
+        self.console.print.assert_not_called()
+
+    async def test_tool_call_cut_off_mid_arguments_is_dropped(self):
+        # The stream dies while the arguments are still arriving. Flushing the
+        # truncated JSON would only crash whoever tries to call the tool with it.
+        first_half = SimpleNamespace(
+            index=0, id="call_1",
+            function=SimpleNamespace(name="fs.read_file", arguments='{"path": "/etc/ho'),
+        )
+
+        async def failing_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="reading "))])
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(tool_calls=[first_half]))])
+            raise ValueError("bad chunk")
+
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            response_text, tool_calls, _ = await manager.process_streaming_response(
+                failing_stream(),
+                answer_render_mode="plain",
+            )
+
+        self.assertEqual(response_text, "reading ")
+        self.assertEqual(tool_calls, [])
+
+    async def test_stream_error_with_markup_characters_is_reported_intact(self):
+        # Provider errors carry brackets (pydantic's validation messages are
+        # full of them); rich must not read them as markup.
+        message = "1 validation error [type=missing, input_value={'a': 1}]"
+
+        async def failing_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            raise ValueError(message)
+
+        console = Console(file=StringIO(), force_terminal=False, width=200, no_color=True)
+        manager = StreamingManager(console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            await manager.process_streaming_response(failing_stream(), answer_render_mode="plain")
+
+        printed = console.file.getvalue()
+        self.assertIn(message, printed)
+
+    async def test_stream_error_omits_log_path_when_nothing_is_recorded(self):
+        async def failing_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            raise ValueError("bad chunk")
+
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.client_log_path", return_value=None), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None
+        ):
+            await manager.process_streaming_response(failing_stream(), answer_render_mode="plain")
+
+        printed = " ".join(str(call.args[0]) for call in self.console.print.call_args_list if call.args)
+        self.assertIn("ended early", printed)
+        self.assertNotIn("Details in", printed)
+
+    async def test_incomplete_tool_call_buffer_is_dropped(self):
+        # Arguments arrived but no function name: not a callable tool call.
+        partial = SimpleNamespace(
+            index=0, id="call_1",
+            function=SimpleNamespace(name=None, arguments='{"a":'),
+        )
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            _, tool_calls, _ = await manager.process_streaming_response(
+                _stream_chunks(DummyChunk(choices=[DummyChoice(DummyDelta(tool_calls=[partial]))])),
+                print_response=False,
+            )
+
+        self.assertEqual(tool_calls, [])
+
+    async def test_error_reported_inside_a_chunk_ends_the_stream(self):
+        # A provider that fails after the stream opened reports it as a chunk
+        # carrying an error and an empty choices list, then keeps the
+        # connection alive. Skipping it leaves the client reading a stream that
+        # will never produce anything, with nothing on screen to explain why.
+        consumed_past_error = False
+
+        async def erroring_stream():
+            nonlocal consumed_past_error
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            yield DummyChunk(
+                choices=[DummyChoice(DummyDelta(content=""), finish_reason="error")],
+                error={"code": 400, "message": "invalid tool name"},
+            )
+            consumed_past_error = True
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="never arrives"))])
+
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.Markdown", side_effect=lambda text: f"MD::{text}"), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics",
+            return_value=None,
+        ):
+            response_text, _, _ = await manager.process_streaming_response(
+                erroring_stream(),
+                answer_render_mode="plain",
+            )
+
+        printed = " ".join(str(call.args[0]) for call in self.console.print.call_args_list if call.args)
+
+        self.assertFalse(consumed_past_error)
+        self.assertEqual(response_text, "partial ")
+        self.assertIn("ended early", printed)
+        self.assertIn("invalid tool name", printed)
+
+    async def test_stream_left_early_is_closed(self):
+        # Leaving the loop on a provider error abandons a stream that is still
+        # open, holding its HTTP connection until the garbage collector runs.
+        async def erroring_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            yield DummyChunk(
+                choices=[DummyChoice(DummyDelta(content=""), finish_reason="error")],
+                error={"message": "invalid tool name"},
+            )
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="never arrives"))])
+
+        stream = erroring_stream()
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.Markdown", side_effect=lambda text: f"MD::{text}"), patch(
+            "mcp_client_for_ollama.utils.streaming.extract_metrics",
+            return_value=None,
+        ):
+            await manager.process_streaming_response(stream, answer_render_mode="plain")
+
+        # A closed async generator refuses to resume.
+        with self.assertRaises(StopAsyncIteration):
+            await stream.__anext__()
+
+    async def test_error_reported_inside_a_chunk_is_silent_when_not_printing(self):
+        async def erroring_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="partial "))])
+            yield DummyChunk(
+                choices=[DummyChoice(DummyDelta(content=""), finish_reason="error")],
+                error={"code": 400, "message": "invalid tool name"},
+            )
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(content="never arrives"))])
+
+        manager = StreamingManager(self.console)
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            response_text, _, _ = await manager.process_streaming_response(
+                erroring_stream(),
+                print_response=False,
+            )
+
+        self.assertEqual(response_text, "partial ")
+        self.console.print.assert_not_called()
+
+    async def test_aborted_stream_is_closed_when_not_printing(self):
+        # Aborting used to return straight out of the silent path, leaving the
+        # stream open with its HTTP connection until the collector got there.
+        async def endless_stream():
+            while True:
+                yield DummyChunk(choices=[DummyChoice(DummyDelta(content="chunk "))])
+
+        stream = endless_stream()
+        manager = StreamingManager(self.console)
+        seen = 0
+
+        def cancelled():
+            nonlocal seen
+            seen += 1
+            return seen > 1
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            response_text, _, _ = await manager.process_streaming_response(
+                stream,
+                print_response=False,
+                cancellation_check=cancelled,
+            )
+
+        self.assertEqual(response_text, "chunk ")
+        self.console.print.assert_not_called()
+        # A closed async generator refuses to resume.
+        with self.assertRaises(StopAsyncIteration):
+            await stream.__anext__()
+
+    async def test_aborted_stream_keeps_tool_calls_already_received(self):
+        # The abort leaves the loop before any finish_reason, so a tool call
+        # that arrived in full has to be flushed on the way out.
+        tool_call = SimpleNamespace(
+            index=0, id="call_1",
+            function=SimpleNamespace(name="time.get_current_time", arguments="{}"),
+        )
+
+        async def endless_stream():
+            yield DummyChunk(choices=[DummyChoice(DummyDelta(tool_calls=[tool_call]))])
+            while True:
+                yield DummyChunk(choices=[DummyChoice(DummyDelta(content="chunk "))])
+
+        manager = StreamingManager(self.console)
+        seen = 0
+
+        def cancelled():
+            nonlocal seen
+            seen += 1
+            return seen > 1
+
+        with patch("mcp_client_for_ollama.utils.streaming.extract_metrics", return_value=None):
+            _, tool_calls, _ = await manager.process_streaming_response(
+                endless_stream(),
+                print_response=False,
+                cancellation_check=cancelled,
+            )
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["function"]["name"], "time.get_current_time")
 
 
 class TestBlockMarkdownRendererHelpers(unittest.TestCase):

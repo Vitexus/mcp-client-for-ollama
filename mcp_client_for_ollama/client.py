@@ -32,7 +32,8 @@ from . import __version__
 from .config.manager import ConfigManager
 from .config.defaults import default_config, default_provider_profile
 from .utils.version import check_for_updates
-from .utils.constants import DEFAULT_CLAUDE_CONFIG, DEFAULT_MODEL, DEFAULT_OLLAMA_HOST, DEFAULT_PROVIDER, SUPPORTED_PROVIDERS, DEFAULT_COMPLETION_STYLE, DEFAULT_HISTORY_DISPLAY_LIMIT, MAX_COMPLETION_MENU_ROWS, OLLMCP_ASCII_ART, REASONING_EFFORT_LEVELS, DEFAULT_REASONING_EFFORT
+from .utils.constants import DEFAULT_CLAUDE_CONFIG, DEFAULT_MODEL, DEFAULT_OLLAMA_HOST, DEFAULT_PROVIDER, SUPPORTED_PROVIDERS, DEFAULT_COMPLETION_STYLE, DEFAULT_HISTORY_DISPLAY_LIMIT, MAX_COMPLETION_MENU_ROWS, OLLMCP_ASCII_ART, REASONING_EFFORT_LEVELS, DEFAULT_REASONING_EFFORT, SERVER_LOG_DIR, MCP_LOG_LEVELS
+from .utils.client_logs import start_client_log
 from .utils.connection import preflight_ollama, validate_provider
 from .utils.images import apply_images
 from .server.connector import ServerConnector
@@ -40,7 +41,7 @@ from .server import registry
 from .server.cli_commands import mcp_app
 from .models.manager import ModelManager
 from .models.config_manager import ModelConfigManager
-from .tools.manager import ToolManager
+from .tools.manager import ToolManager, build_tool_payload
 from .prompts.manager import PromptManager
 from .prompts.handler import PromptHandler
 from .prompts.commands import run_slash_command
@@ -53,11 +54,6 @@ from .utils.tool_display import ToolDisplayManager
 from .utils.hil_manager import HumanInTheLoopManager, AbortQueryException
 from .utils.fzf_style_completion import FZFStyleCompleter
 from .utils.input import get_input_no_autocomplete
-from .utils.schema_validation import (
-    SchemaValidationError,
-    normalize_tool_arguments,
-    validate_tool_arguments,
-)
 
 
 class MCPClient:
@@ -75,7 +71,7 @@ class MCPClient:
         "multiline": "Multiline",
     }
 
-    def __init__(self, model: str = DEFAULT_MODEL, host: str = DEFAULT_OLLAMA_HOST, provider: str = DEFAULT_PROVIDER, api_key: str = None, persist_api_key: bool = True):
+    def __init__(self, model: str = DEFAULT_MODEL, host: str = DEFAULT_OLLAMA_HOST, provider: str = DEFAULT_PROVIDER, api_key: str = None, persist_api_key: bool = True, debug: bool = False, log_level: str = None):
         # Initialize session and client objects
         self.exit_stack = AsyncExitStack()
         self.host = host
@@ -88,7 +84,7 @@ class MCPClient:
         self.console = Console()
         self.config_manager = ConfigManager(self.console)
         # Initialize the server connector
-        self.server_connector = ServerConnector(self.exit_stack, self.console)
+        self.server_connector = ServerConnector(self.exit_stack, self.console, debug=debug, log_level=log_level)
         # Initialize the model manager
         self.model_manager = ModelManager(console=self.console, default_model=model, llm=self.llm, provider=provider, api_base=host, api_key=api_key or "")
         # Initialize the model config manager
@@ -493,6 +489,73 @@ class MCPClient:
             if len(self.chat_history) > max_history:
                 self.console.print(f"[dim](Showing last {max_history} of {len(self.chat_history)} conversations)[/dim]")
 
+    def _extract_tool_response(self, result, has_vision: bool = False):
+        """Build the text forwarded to the LLM from a tool CallToolResult.
+
+        Returns (tool_response, tool_images).
+        """
+        text_parts = []
+        tool_images = []  # List of base64 strings
+        # Whether the server sent any text block of its own. The placeholders we
+        # write for images, audio and resources are ours, not the server's.
+        has_server_text = False
+
+        for content_item in result.content:
+            if hasattr(content_item, 'type') and content_item.type == "image":
+                base64_data = getattr(content_item, 'data', '')
+                mime_type = getattr(content_item, 'mime_type', 'unknown')
+                tool_images.append(base64_data)
+                if has_vision:
+                    text_parts.append(f"[Image: {mime_type}, {len(base64_data)} bytes]")
+                else:
+                    text_parts.append(f"[Image returned but not processed: {mime_type} - current model does not support vision]")
+            elif hasattr(content_item, 'type') and content_item.type == "audio":
+                mime_type = getattr(content_item, 'mime_type', 'unknown')
+                data = getattr(content_item, 'data', '')
+                text_parts.append(f"[Audio returned but not processed: {mime_type}, {len(data)} bytes - Ollama does not support audio input]")
+            elif hasattr(content_item, 'type') and content_item.type == "resource" and hasattr(content_item, 'resource'):
+                # TODO: Handle MCP resource content (type="resource") — extract text/blob from
+                #       content_item.resource and forward to LLM once resource support is implemented.
+                resource = content_item.resource
+                uri = getattr(resource, 'uri', 'unknown')
+                mime_type = getattr(resource, 'mime_type', 'unknown')
+                text_parts.append(f"[Resource returned but not processed: {uri} ({mime_type}) - resource support not yet implemented]")
+            elif hasattr(content_item, 'type') and content_item.type == "resource_link":
+                # TODO: Handle MCP resource links (type="resource_link") — fetch content via
+                #       resources/read using the URI once resource support is implemented.
+                uri = getattr(content_item, 'uri', 'unknown')
+                name = getattr(content_item, 'name', '')
+                mime_type = getattr(content_item, 'mime_type', 'unknown')
+                label = f" ({name})" if name else ""
+                text_parts.append(f"[Resource link returned but not fetched: {uri}{label} ({mime_type}) - resource support not yet implemented]")
+            elif hasattr(content_item, 'text'):
+                has_server_text = True
+                text_parts.append(str(content_item.text))
+            else:
+                has_server_text = True
+                text_parts.append(str(content_item))
+
+        # A tool that returns structured content SHOULD also serialize it into a
+        # text block, but the spec asks for that only "for backwards
+        # compatibility" -- a SHOULD, so a conforming server may answer with
+        # structuredContent and no text at all, and the whole result would then
+        # reach the model as "no text content returned" (issue #303). So the
+        # payload is forwarded exactly when the server sent no text of its own.
+        # When it did, that text is what the model gets: both fields carry the
+        # same information by construction -- each SDK builds them from one
+        # return value -- and SEP-1624 is explicit that a client SHOULD NOT
+        # forward both:
+        # https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1624
+        # Serialized compactly (this copy is ours, and indentation buys the
+        # model nothing) and with ensure_ascii=False, since escaping non-ASCII
+        # to \uXXXX inflates the payload and small local models echo the escapes
+        # back verbatim.
+        if not has_server_text and result.structured_content is not None:
+            text_parts.append(json.dumps(result.structured_content, separators=(",", ":"), ensure_ascii=False, default=str))
+
+        tool_response = "\n\n".join(text_parts) if text_parts else "Tool executed successfully (no text content returned)"
+        return tool_response, tool_images
+
     async def process_query(self, query: str, images=None) -> str:
         """Process a query using Ollama and available tools"""
         if not self.model_manager.get_current_model():
@@ -548,14 +611,9 @@ class MCPClient:
         if not enabled_tool_objects:
             self.console.print("[yellow]Warning: No tools are enabled. Model will respond without tool access.[/yellow]")
 
-        available_tools = [{
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.input_schema
-            }
-        } for tool in enabled_tool_objects]
+        # Providers reject the dot in a qualified "<server>.<tool>" name, so the
+        # payload carries a sanitized one and we map it back before dispatching.
+        available_tools, wire_to_qualified = build_tool_payload(enabled_tool_objects)
 
         # Get current model from the model manager
         model = self.model_manager.get_current_model()
@@ -566,16 +624,21 @@ class MCPClient:
         # Check vision capability once for the entire query
         has_vision = await self.supports_vision()
 
-        # Initial LLM API call with the query and available tools
-        stream = await self.llm.acompletion(
-            model=model,
-            messages=apply_images(messages),
-            stream=True,
-            stream_options={"include_usage": True},
-            tools=available_tools or None,
-            **self._reasoning_effort_kwargs(supports_thinking),
-            **self.model_config_manager.get_completion_kwargs(self.provider),
-        )
+        # Initial LLM API call with the query and available tools.
+        # The spinner in the streaming manager only starts once the response
+        # headers are in, so without one here the terminal sits blank for the
+        # whole request. Locally that is imperceptible; against a cloud provider
+        # it is seconds, and a request that never comes back looks like a freeze.
+        with self.console.status(f"[cyan]waiting for {self.provider}..."):
+            stream = await self.llm.acompletion(
+                model=model,
+                messages=apply_images(messages),
+                stream=True,
+                stream_options={"include_usage": True},
+                tools=available_tools or None,
+                **self._reasoning_effort_kwargs(supports_thinking),
+                **self.model_config_manager.get_completion_kwargs(self.provider),
+            )
 
         # Process the streaming response with thinking mode support
         response_text = ""
@@ -605,10 +668,6 @@ class MCPClient:
             self.actual_token_count += metrics['completion_tokens']
 
         enabled_tools = self.tool_manager.get_enabled_tool_objects()
-        tool_schema_map = {
-            tool.name: (tool.input_schema or {"type": "object"})
-            for tool in enabled_tool_objects
-        }
 
         loop_count = 0
         iteration_budget = self.loop_limit
@@ -640,22 +699,11 @@ class MCPClient:
             loop_count += 1
 
             for tool in pending_tool_calls:
-                tool_name = tool["function"]["name"]
+                # Back to the qualified name everything below (and the user) knows.
+                # A model that echoes the qualified name anyway still resolves.
+                tool_name = wire_to_qualified.get(tool["function"]["name"], tool["function"]["name"])
                 tool_call_id = tool["id"]
-                raw_tool_args = tool["function"]["arguments"]
-
-                try:
-                    tool_args = normalize_tool_arguments(raw_tool_args)
-                    validate_tool_arguments(tool_args, tool_schema_map.get(tool_name))
-                except SchemaValidationError as e:
-                    error_msg = f"Schema validation failed for {tool_name}: {str(e)}"
-                    self.console.print(f"[red]{error_msg}[/red]")
-                    messages.append({
-                        "role": "tool",
-                        "content": error_msg,
-                        "tool_call_id": tool_call_id
-                    })
-                    continue
+                tool_args = json.loads(tool["function"]["arguments"]) if tool["function"]["arguments"] else {}
 
                 # Parse server name and actual tool name from the qualified name
                 server_name, actual_tool_name = tool_name.split('.', 1) if '.' in tool_name else (None, tool_name)
@@ -717,43 +765,8 @@ class MCPClient:
 
                 # Extract content from tool response - decoupled from display
                 # MCP responses can contain multiple content items (text, images, etc.)
-                text_parts = []
-                tool_images = []  # List of base64 strings
+                tool_response, tool_images = self._extract_tool_response(result, has_vision=has_vision)
 
-                for content_item in result.content:
-                    if hasattr(content_item, 'type') and content_item.type == "image":
-                        base64_data = getattr(content_item, 'data', '')
-                        mime_type = getattr(content_item, 'mime_type', 'unknown')
-                        tool_images.append(base64_data)
-                        if has_vision:
-                            text_parts.append(f"[Image: {mime_type}, {len(base64_data)} bytes]")
-                        else:
-                            text_parts.append(f"[Image returned but not processed: {mime_type} - current model does not support vision]")
-                    elif hasattr(content_item, 'type') and content_item.type == "audio":
-                        mime_type = getattr(content_item, 'mime_type', 'unknown')
-                        data = getattr(content_item, 'data', '')
-                        text_parts.append(f"[Audio returned but not processed: {mime_type}, {len(data)} bytes - Ollama does not support audio input]")
-                    elif hasattr(content_item, 'type') and content_item.type == "resource" and hasattr(content_item, 'resource'):
-                        # TODO: Handle MCP resource content (type="resource") — extract text/blob from
-                        #       content_item.resource and forward to LLM once resource support is implemented.
-                        resource = content_item.resource
-                        uri = getattr(resource, 'uri', 'unknown')
-                        mime_type = getattr(resource, 'mime_type', 'unknown')
-                        text_parts.append(f"[Resource returned but not processed: {uri} ({mime_type}) - resource support not yet implemented]")
-                    elif hasattr(content_item, 'type') and content_item.type == "resource_link":
-                        # TODO: Handle MCP resource links (type="resource_link") — fetch content via
-                        #       resources/read using the URI once resource support is implemented.
-                        uri = getattr(content_item, 'uri', 'unknown')
-                        name = getattr(content_item, 'name', '')
-                        mime_type = getattr(content_item, 'mime_type', 'unknown')
-                        label = f" ({name})" if name else ""
-                        text_parts.append(f"[Resource link returned but not fetched: {uri}{label} ({mime_type}) - resource support not yet implemented]")
-                    elif hasattr(content_item, 'text'):
-                        text_parts.append(str(content_item.text))
-                    else:
-                        text_parts.append(str(content_item))
-
-                tool_response = "\n\n".join(text_parts) if text_parts else "Tool executed successfully (no text content returned)"
 
                 # Display tool response (independent of content extraction)
                 self.tool_display_manager.display_tool_response(
@@ -785,15 +798,16 @@ class MCPClient:
 
 
             # Get stream response from LLM with the tool results
-            stream = await self.llm.acompletion(
-                model=model,
-                messages=apply_images(messages),
-                stream=True,
-                stream_options={"include_usage": True},
-                tools=available_tools or None,
-                **self._reasoning_effort_kwargs(supports_thinking),
-                **self.model_config_manager.get_completion_kwargs(self.provider),
-            )
+            with self.console.status(f"[cyan]waiting for {self.provider}..."):
+                stream = await self.llm.acompletion(
+                    model=model,
+                    messages=apply_images(messages),
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    tools=available_tools or None,
+                    **self._reasoning_effort_kwargs(supports_thinking),
+                    **self.model_config_manager.get_completion_kwargs(self.provider),
+                )
 
             # Process the streaming response with thinking mode support
             followup_response, pending_tool_calls, followup_metrics = await self.streaming_manager.process_streaming_response(
@@ -1173,7 +1187,7 @@ class MCPClient:
 
             "[bold cyan]Context:[/bold cyan]\n"
             "• Type [bold]/context[/bold] or [bold]/c[/bold] to toggle context retention\n"
-            "• Type [bold]/clear[/bold] or [bold]/cc[/bold] to clear conversation context\n"
+            "• Type [bold]/clear[/bold], [bold]/new[/bold] or [bold]/cc[/bold] to clear conversation context\n"
             "• Type [bold]/context-info[/bold] or [bold]/ci[/bold] to display context info\n\n"
 
             "[bold cyan]History:[/bold cyan] \n"
@@ -1209,7 +1223,7 @@ class MCPClient:
             "• Type [bold]/server:prompt_name[/bold] to invoke an MCP server prompt\n"
             "• [bold bright_magenta](New!)[/bold bright_magenta] Type [bold]@resource_uri[/bold] to read a resource or [bold]@[/bold] for autocomplete suggestions\n"
             "• Type [bold]/input-mode[/bold] or [bold]/im[/bold] to switch single-line or multiline chat input\n"
-            "• Type [bold]/clear[/bold] or [bold]/cc[/bold] to clear conversation context\n"
+            "• Type [bold]/clear[/bold], [bold]/new[/bold] or [bold]/cc[/bold] to clear conversation context\n"
             "• Type [bold]/help[/bold] or [bold]/h[/bold] to see the [underline]full command list[/underline]\n"
             "• Type [bold]/quit[/bold] or [bold]/q[/bold] to exit the client\n",
             title="[bold]Startup Help[/bold]", border_style="yellow", expand=False))
@@ -1547,15 +1561,16 @@ class MCPClient:
             ),
         })
 
-        stream = await self.llm.acompletion(
-            model=model,
-            messages=apply_images(messages),
-            stream=True,
-            stream_options={"include_usage": True},
-            tools=None,
-            **self._reasoning_effort_kwargs(supports_thinking),
-            **self.model_config_manager.get_completion_kwargs(self.provider),
-        )
+        with self.console.status(f"[cyan]waiting for {self.provider}..."):
+            stream = await self.llm.acompletion(
+                model=model,
+                messages=apply_images(messages),
+                stream=True,
+                stream_options={"include_usage": True},
+                tools=None,
+                **self._reasoning_effort_kwargs(supports_thinking),
+                **self.model_config_manager.get_completion_kwargs(self.provider),
+            )
 
         wrap_text, _, wrap_metrics = await self.streaming_manager.process_streaming_response(
             stream,
@@ -2123,6 +2138,16 @@ def main(
     version: Optional[bool] = typer.Option(
         None, "--version", "-v",
         help="Show version and exit",
+    ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help=f"Show on screen what the servers report (stderr and log notifications) as it arrives. Saved to {SERVER_LOG_DIR.replace(os.path.expanduser('~'), '~')}/ either way.",
+        rich_help_panel="MCP Server Logging",
+    ),
+    log_level: Optional[str] = typer.Option(
+        None, "--log-level", metavar="LEVEL",
+        help=f"Show on screen the log notifications of this level or higher (not stderr, that is --debug): {', '.join(MCP_LOG_LEVELS)}.",
+        rich_help_panel="MCP Server Logging",
     )
 ):
     """Run the MCP Client for Ollama with specified options."""
@@ -2134,12 +2159,18 @@ def main(
         typer.echo(f"ollmcp {__version__}")
         raise typer.Exit()
 
+    if log_level is not None:
+        log_level = log_level.lower()
+        if log_level not in MCP_LOG_LEVELS:
+            typer.echo(f"Error: --log-level must be one of {', '.join(MCP_LOG_LEVELS)} (got: {log_level})", err=True)
+            raise typer.Exit(code=1)
+
     # Run the async main function with proper cleanup
     # Use manual loop management to ensure subprocesses cleanup before loop closes
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, provider, api_key))
+        loop.run_until_complete(async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, provider, api_key, debug, log_level))
     finally:
         try:
             # Ensure executor cleanup completes before closing loop
@@ -2148,9 +2179,10 @@ def main(
         finally:
             loop.close()
 
-async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, provider, api_key):
+async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, provider, api_key, debug=False, log_level=None):
     """Asynchronous main function to run the MCP Client for Ollama"""
 
+    start_client_log()
     console = Console()
 
     # Resolve the provider and its saved connection profile before building the
@@ -2192,7 +2224,7 @@ async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, m
     resolved_model = model or profile.get("model") or DEFAULT_MODEL
 
     try:
-        client = MCPClient(model=resolved_model, host=resolved_host, provider=effective_provider, api_key=resolved_api_key, persist_api_key=persist_api_key)
+        client = MCPClient(model=resolved_model, host=resolved_host, provider=effective_provider, api_key=resolved_api_key, persist_api_key=persist_api_key, debug=debug, log_level=log_level)
     except MissingApiKeyError as e:
         console.print(Panel(
             f"[bold red]API key required:[/bold red] The [bold blue]{effective_provider}[/bold blue] provider needs an API key.\n\n"

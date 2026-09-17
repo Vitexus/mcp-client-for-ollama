@@ -8,6 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# MacOS
+.DS_Store
+
+# IDE
+.vscode
+.claude
+
+# Packaging
+
 .pybuild/
 debian/mcp-client-for-ollama.postinst.debhelper
 debian/mcp-client-for-ollama.substvars
@@ -16,3 +26,4 @@ debian/.debhelper/
 debian/mcp-client-for-ollama.prerm.debhelper
 debian/debhelper-build-stamp
 debian/files
+
